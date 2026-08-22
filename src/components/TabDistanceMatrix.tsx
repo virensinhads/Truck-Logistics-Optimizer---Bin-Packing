@@ -1,8 +1,5 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
-  MapPin,
-  Play,
-  Download,
   Upload,
   RefreshCw,
   CheckCircle2,
@@ -13,8 +10,10 @@ import {
   Layers,
   Sparkles,
   Info,
-  Edit2,
-  Check
+  Check,
+  FileUp,
+  HelpCircle,
+  Download
 } from 'lucide-react';
 import { DistanceMatrixData, LocationPoint, OrderLineItem } from '../types';
 import {
@@ -26,7 +25,11 @@ import {
   getLocationKey
 } from '../utils/distanceMatrixEngine';
 import { SAMPLE_SALES_REGISTER_ORDERS } from '../utils/sampleData';
-import { parseSalesRegisterFile } from '../utils/excelHandler';
+import {
+  parseSalesRegisterFile,
+  parseDistanceMatrixExcel,
+  downloadSampleDistanceMatrixTemplate
+} from '../utils/excelHandler';
 
 interface TabDistanceMatrixProps {
   cachedMatrix: DistanceMatrixData | null;
@@ -42,6 +45,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
   setActiveOrders,
 }) => {
   const [isRunning, setIsRunning] = useState(false);
+  const [isUploadingMatrix, setIsUploadingMatrix] = useState(false);
   const [progress, setProgress] = useState<{
     percent: number;
     step: string;
@@ -59,7 +63,9 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [editingCell, setEditingCell] = useState<{ fromKey: string; toKey: string } | null>(null);
   const [editValue, setEditValue] = useState<string>('');
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  const matrixFileInputRef = useRef<HTMLInputElement>(null);
 
   // Derive unique locations from activeOrders or sample data
   const currentLocations: LocationPoint[] = useMemo(() => {
@@ -69,10 +75,10 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     return extractUniqueLocations(SAMPLE_SALES_REGISTER_ORDERS);
   }, [activeOrders]);
 
-  // Execute Script 1
+  // Execute Script 1 (Live API evaluation)
   const handleRunScript1 = async () => {
     if (currentLocations.length === 0) {
-      setStatusMessage('No valid coordinates found to compute matrix.');
+      setStatusMessage({ text: 'No valid coordinates found to compute matrix.', type: 'error' });
       return;
     }
 
@@ -85,26 +91,75 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
       });
       setCachedMatrix(matrixData);
       saveDistanceMatrixToStorage(matrixData);
-      setStatusMessage(`Success! Distance matrix generated for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs) and saved as distanceMatrix.`);
+      setStatusMessage({
+        text: `Success! Distance matrix evaluated via Script 1 for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs) and saved as distanceMatrix.`,
+        type: 'success',
+      });
     } catch (err: any) {
-      setStatusMessage(`Error generating distance matrix: ${err?.message || 'Unknown error'}`);
+      setStatusMessage({
+        text: `Error generating distance matrix: ${err?.message || 'Unknown error'}`,
+        type: 'error',
+      });
     } finally {
       setIsRunning(false);
     }
   };
 
   // Handle uploaded sales register to extract coordinates
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSalesRegisterUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     try {
       const orders = await parseSalesRegisterFile(file);
       setActiveOrders(orders);
-      setStatusMessage(`Loaded ${orders.length} orders from ${file.name}. Found ${extractUniqueLocations(orders).length} unique coordinate pairs.`);
+      setStatusMessage({
+        text: `Loaded ${orders.length} orders from ${file.name}. Found ${extractUniqueLocations(orders).length} unique coordinate locations.`,
+        type: 'success',
+      });
     } catch (err: any) {
-      setStatusMessage(`Failed to read file: ${err?.message || 'Invalid format'}`);
+      setStatusMessage({
+        text: `Failed to read sales register: ${err?.message || 'Invalid format'}`,
+        type: 'error',
+      });
+    } finally {
+      e.target.value = '';
     }
+  };
+
+  // Handle uploaded distance matrix file (Pairwise list or Grid)
+  const handleDistanceMatrixUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploadingMatrix(true);
+    setStatusMessage(null);
+
+    try {
+      const parsedMatrix = await parseDistanceMatrixExcel(file);
+      setCachedMatrix(parsedMatrix);
+      saveDistanceMatrixToStorage(parsedMatrix);
+      setStatusMessage({
+        text: `Successfully uploaded Distance Matrix from "${file.name}"! Loaded ${parsedMatrix.locations.length} locations (${parsedMatrix.stats.totalPairs} pairwise road distances). All optimization scripts will now reference this matrix.`,
+        type: 'success',
+      });
+    } catch (err: any) {
+      setStatusMessage({
+        text: `Failed to upload Distance Matrix file: ${err?.message || 'Please check sample template format'}`,
+        type: 'error',
+      });
+    } finally {
+      setIsUploadingMatrix(false);
+      if (matrixFileInputRef.current) {
+        matrixFileInputRef.current.value = '';
+      }
+    }
+  };
+
+  // Handle downloading sample distance matrix format template
+  const handleDownloadSampleFormat = () => {
+    const locs = cachedMatrix?.locations || currentLocations;
+    downloadSampleDistanceMatrixTemplate(locs, 'Sample_Distance_Matrix_Template.xlsx');
   };
 
   // Handle manual distance edit
@@ -147,41 +202,68 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
           <div className="space-y-1.5 max-w-3xl">
             <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-xs bg-[#0F172A] text-[#38BDF8] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#334155]">
               <Sparkles className="w-3 h-3 text-[#38BDF8]" />
-              <span>Script 1: 3-Tier Distance Matrix Engine</span>
+              <span>Script 1: Distance Matrix Engine</span>
             </div>
             <h1 className="text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
-              Refresh Distance Matrix Engine
+              Distance Matrix Management &amp; Evaluation
             </h1>
             <p className="text-xs text-[#64748B] font-mono leading-relaxed">
-              Processes unique coordinates (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">Lat, Lon</code>) from sales register orders, computes road network distances via <strong className="text-[#0F172A]">OSM Table API</strong> with <strong className="text-[#0F172A]">Route API fallback</strong> and <strong className="text-[#0F172A]">1.3x Haversine circuity</strong>, saving to <code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">distanceMatrix</code>.
+              Provides the pairwise road distances (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">km</code>) required by the multi-drop clustering algorithm. You can either <strong className="text-[#0F172A]">evaluate live via Script 1 API</strong> or <strong className="text-[#0F172A]">upload your custom Distance Matrix Excel file</strong> directly.
             </p>
           </div>
 
           {/* Action Trigger Box */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-            <label className="flex items-center justify-center gap-1.5 px-3.5 py-1.5 bg-white hover:bg-[#F8FAFC] text-[#334155] rounded-sm text-xs font-mono font-semibold cursor-pointer border border-[#CBD5E1] transition shadow-2xs">
-              <Upload className="w-3.5 h-3.5 text-[#64748B]" />
-              <span>Upload Sales Register</span>
-              <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} className="hidden" />
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Download Sample Format */}
+            <button
+              id="btn-download-matrix-sample"
+              onClick={handleDownloadSampleFormat}
+              className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#F8FAFC] hover:bg-[#F1F5F9] text-[#334155] rounded-sm text-xs font-mono font-semibold cursor-pointer border border-[#CBD5E1] transition shadow-2xs"
+              title="Download sample Excel format template to fill custom distances"
+            >
+              <Download className="w-3.5 h-3.5 text-[#0284C7]" />
+              <span>Sample Matrix Template</span>
+            </button>
+
+            {/* Upload Distance Matrix File */}
+            <label
+              id="btn-upload-distance-matrix"
+              className={`flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#0284C7] hover:bg-[#0369A1] text-white rounded-sm text-xs font-mono font-bold cursor-pointer transition shadow-2xs ${
+                isUploadingMatrix ? 'opacity-70 cursor-not-allowed' : ''
+              }`}
+              title="Upload your own custom distance matrix Excel file"
+            >
+              <FileUp className="w-3.5 h-3.5 text-white" />
+              <span>{isUploadingMatrix ? 'Reading File...' : 'Upload Distance Matrix'}</span>
+              <input
+                ref={matrixFileInputRef}
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={handleDistanceMatrixUpload}
+                disabled={isUploadingMatrix}
+                className="hidden"
+              />
             </label>
 
+            {/* Evaluate via Live Script 1 API */}
             <button
               id="btn-run-script1"
               onClick={handleRunScript1}
               disabled={isRunning}
-              className={`flex items-center justify-center gap-2 px-4 py-1.5 rounded-sm text-xs font-mono font-bold uppercase tracking-wider transition shadow-2xs cursor-pointer ${
+              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 rounded-sm text-xs font-mono font-bold uppercase tracking-wider transition shadow-2xs cursor-pointer ${
                 isRunning
                   ? 'bg-[#94A3B8] text-white cursor-not-allowed opacity-75'
                   : 'bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155]'
               }`}
+              title="Compute distance matrix automatically using OSM API & Haversine fallback"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin text-[#38BDF8]' : ''}`} />
-              <span>{isRunning ? 'Computing...' : 'Generate Matrix (Script 1)'}</span>
+              <span>{isRunning ? 'Computing...' : 'Evaluate via API (Script 1)'}</span>
             </button>
           </div>
         </div>
 
-        {/* Progress Bar during Execution */}
+        {/* Progress Bar during API Execution */}
         {isRunning && (
           <div className="mt-4 pt-3 border-t border-[#E2E8F0] space-y-1.5 font-mono">
             <div className="flex items-center justify-between text-xs font-bold text-[#0F172A]">
@@ -205,29 +287,81 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
           </div>
         )}
 
+        {/* Status Alert Banner */}
         {statusMessage && !isRunning && (
-          <div className="mt-3 p-2.5 rounded-sm bg-[#F8FAFC] border border-[#CBD5E1] text-xs font-mono text-[#0F172A] flex items-center justify-between">
+          <div
+            className={`mt-3 p-2.5 rounded-sm border text-xs font-mono flex items-center justify-between ${
+              statusMessage.type === 'success'
+                ? 'bg-[#F0FDF4] border-[#86EFAC] text-[#166534]'
+                : statusMessage.type === 'error'
+                ? 'bg-[#FEF2F2] border-[#FECACA] text-[#991B1B]'
+                : 'bg-[#F8FAFC] border-[#CBD5E1] text-[#0F172A]'
+            }`}
+          >
             <div className="flex items-center gap-1.5">
-              <CheckCircle2 className="w-4 h-4 text-[#059669] shrink-0" />
-              <span>{statusMessage}</span>
+              {statusMessage.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-[#16A34A] shrink-0" />
+              ) : statusMessage.type === 'error' ? (
+                <AlertCircle className="w-4 h-4 text-[#DC2626] shrink-0" />
+              ) : (
+                <Info className="w-4 h-4 text-[#0284C7] shrink-0" />
+              )}
+              <span>{statusMessage.text}</span>
             </div>
-            <button onClick={() => setStatusMessage(null)} className="text-[#94A3B8] hover:text-[#0F172A] text-xs cursor-pointer">
+            <button
+              onClick={() => setStatusMessage(null)}
+              className="text-[#94A3B8] hover:text-[#0F172A] text-xs cursor-pointer ml-3 font-semibold"
+            >
               Dismiss
             </button>
           </div>
         )}
       </div>
 
+      {/* Format Helper Card */}
+      <div className="bg-[#F8FAFC] rounded-lg border border-[#E2E8F0] p-3 text-xs font-mono text-[#475569] space-y-2">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <HelpCircle className="w-4 h-4 text-[#0284C7] shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold text-[#0F172A]">Distance Matrix Upload Guidelines: </span>
+              <span>You can upload your file as a <strong>Pairwise Distances List</strong> (columns: <em>From Location, From Lat, From Lon, To Location, To Lat, To Lon, Distance (km)</em>) or as an <strong>N&times;N Matrix Grid</strong>. Click <strong>Sample Matrix Template</strong> to download a ready-to-use template.</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <label className="flex items-center gap-1 text-[11px] text-[#0284C7] hover:underline cursor-pointer font-bold">
+              <Upload className="w-3 h-3" />
+              <span>Upload New Sales Register</span>
+              <input type="file" accept=".xlsx,.xls,.csv" onChange={handleSalesRegisterUpload} className="hidden" />
+            </label>
+          </div>
+        </div>
+
+        {/* Local OSRM Command Reference */}
+        <div className="pt-2 border-t border-[#E2E8F0] flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px]">
+          <div className="flex items-center gap-1.5 text-[#334155]">
+            <Sparkles className="w-3.5 h-3.5 text-[#0284C7]" />
+            <span className="font-bold text-[#0F172A]">Local OSRM Script:</span>
+            <span>Run against <code className="bg-[#E2E8F0] px-1 py-0.2 rounded text-[#0F172A]">http://localhost:5001</code>:</span>
+          </div>
+          <code className="bg-[#0F172A] text-[#38BDF8] px-2 py-1 rounded text-[10px] select-all">
+            npx tsx scripts/generate_osrm_matrix.ts &lt;sales_register.xlsx&gt;
+          </code>
+        </div>
+      </div>
+
       {/* KPI Stats Cards for Distance Matrix */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            Unique Coordinates
+            Unique Locations
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#0F172A]">
             {cachedMatrix ? cachedMatrix.locations.length : currentLocations.length}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">From active dataset</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">
+            {cachedMatrix ? 'Active matrix coordinates' : 'From sales register'}
+          </span>
         </div>
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
@@ -239,27 +373,27 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
               ? cachedMatrix.stats.totalPairs
               : currentLocations.length * currentLocations.length}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">Pairwise matrix grid</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">Pairwise distance entries</span>
         </div>
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            OSM Road Network
+            API Evaluated Pairs
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#0284C7]">
             {cachedMatrix ? cachedMatrix.stats.osmTablePairs + cachedMatrix.stats.osmRoutePairs : 0}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">Tier 1 & Tier 2 API</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">OSM Road Network</span>
         </div>
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            Haversine 1.3x Circuity
+            User Upload / Overrides
           </span>
-          <div className="text-2xl font-mono font-extrabold text-[#D97706]">
-            {cachedMatrix ? cachedMatrix.stats.haversinePairs : currentLocations.length * currentLocations.length}
+          <div className="text-2xl font-mono font-extrabold text-[#7C3AED]">
+            {cachedMatrix ? (cachedMatrix.stats.manualPairs ?? 0) : 0}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">Tier 3 Circuity</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">Custom File or Manual</span>
         </div>
       </div>
 
@@ -297,7 +431,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                 <button
                   id="btn-export-matrix-excel"
                   onClick={() => exportDistanceMatrixToExcel(cachedMatrix, 'distanceMatrix.xlsx')}
-                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-sm bg-[#059669] hover:bg-[#047857] text-white text-xs font-mono font-bold shadow-2xs transition"
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-sm bg-[#059669] hover:bg-[#047857] text-white text-xs font-mono font-bold shadow-2xs transition cursor-pointer"
                   title="Download distanceMatrix.xlsx with all sheets"
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
@@ -307,7 +441,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                 <button
                   id="btn-export-matrix-json"
                   onClick={() => exportDistanceMatrixToJson(cachedMatrix, 'distanceMatrix.json')}
-                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-sm bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155] text-xs font-mono font-bold shadow-2xs transition"
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-sm bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155] text-xs font-mono font-bold shadow-2xs transition cursor-pointer"
                   title="Download distanceMatrix.json structured file"
                 >
                   <FileCode className="w-3.5 h-3.5" />
@@ -410,7 +544,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                                   : source === 'osm-route'
                                   ? 'OSM Route'
                                   : source === 'manual'
-                                  ? 'Manual'
+                                  ? 'Uploaded/Manual'
                                   : '1.3x Hav'}
                               </span>
                             )}
@@ -443,7 +577,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="w-2 h-2 rounded-xs bg-[#7C3AED]" />
-              <span>Manual</span>
+              <span>Uploaded / Manual</span>
             </span>
           </div>
 

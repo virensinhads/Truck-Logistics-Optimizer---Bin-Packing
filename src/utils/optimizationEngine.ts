@@ -31,14 +31,19 @@ interface CandidateGroup {
 /**
  * Returns the minimum threshold required for a vehicle type to satisfy >80% utilization
  */
-export function getMinWeightForVehicle(type: VehicleType): number {
+export function getMinWeightForVehicle(type: VehicleType, enabledTypes?: VehicleType[]): number {
+  const enabled = enabledTypes || ['25', '30', '35'];
   switch (type) {
     case '25':
       return 20.0; // >= 20 MT (80% of 25)
     case '30':
-      return 25.0001; // > 25 MT (> 80% of 30, strictly > 25 MT)
+      // If 25 MT is enabled, 30 MT is prioritized for > 25 MT; otherwise standard 80% is 24.0 MT
+      return enabled.includes('25') ? 25.0001 : 24.0;
     case '35':
-      return 30.0001; // > 30 MT (core >30 MT rule, > 80% of 35)
+      // If 30 MT is enabled, 35 MT is prioritized for > 30 MT; if only 25 enabled, > 25 MT; otherwise 80% is 28.0 MT
+      if (enabled.includes('30')) return 30.0001;
+      if (enabled.includes('25')) return 25.0001;
+      return 28.0;
   }
 }
 
@@ -69,7 +74,7 @@ export function selectBestVehicleForWeight(
   // Priority: 35 MT > 30 MT > 25 MT
   for (const type of sortedEnabled) {
     const maxCap = getMaxCapacityForVehicle(type);
-    const minCap = getMinWeightForVehicle(type);
+    const minCap = getMinWeightForVehicle(type, enabledTypes);
 
     if (weight <= maxCap && weight >= minCap) {
       return type;
@@ -96,7 +101,7 @@ export function buildRouteStops(
   const destMap = new Map<string, { dest: string; lat: number; lon: number; orders: OrderLineItem[]; totalWeight: number; maxOrderWeight: number; earliestExpiry: number }>();
 
   for (const order of orders) {
-    const key = `${order.dest.trim()}_${order.lat.toFixed(4)}_${order.lon.toFixed(4)}`;
+    const key = `${order.dest.trim().toLowerCase()}_${order.lat.toFixed(4)}_${order.lon.toFixed(4)}`;
     const existing = destMap.get(key);
     const orderWeight = order.invQt;
     const expiry = order.calculatedSla?.expiryTimestamp ?? Infinity;
@@ -194,51 +199,153 @@ export function buildRouteStops(
   };
 }
 
+export interface BestSubsetResult {
+  orders: OrderLineItem[];
+  totalWeight: number;
+  stops: RouteStop[];
+  cumulativeDistanceKm: number;
+  isMultiDrop: boolean;
+}
+
 /**
- * Finds combinations of orders that sum up to valid vehicle capacity with >80% utilization
+ * Searches for the subset of orders that maximizes total weight <= maxWeight,
+ * subject to totalWeight >= minWeight, valid SLA overlap, and route cumulative distance <= maxRadiusKm.
  */
-function findSubsetForTargetCapacity(
+function searchOptimalSubset(
   orders: OrderLineItem[],
   minWeight: number,
-  maxWeight: number
-): OrderLineItem[] | null {
-  // Sort descending by weight for greedy-first packing
-  const sorted = [...orders].sort((a, b) => b.invQt - a.invQt);
+  maxWeight: number,
+  maxRadiusKm: number,
+  cachedMatrix?: DistanceMatrixData | null,
+  sameLocationOnly: boolean = false
+): BestSubsetResult | null {
+  if (orders.length === 0) return null;
 
-  // Try single items first
-  for (const o of sorted) {
-    if (o.invQt >= minWeight && o.invQt <= maxWeight) {
-      return [o];
-    }
-  }
+  // Filter out orders exceeding maxWeight
+  const validOrders = orders.filter((o) => o.invQt <= maxWeight);
+  if (validOrders.length === 0) return null;
 
-  // Recursive search for optimal subset
-  function search(index: number, currentWeight: number, currentSet: OrderLineItem[]): OrderLineItem[] | null {
-    if (currentWeight >= minWeight && currentWeight <= maxWeight) {
-      if (doOrdersOverlapSla(currentSet)) {
-        return currentSet;
+  // Sort descending by weight
+  const sorted = [...validOrders].sort((a, b) => b.invQt - a.invQt);
+
+  let bestSet: OrderLineItem[] | null = null;
+  let bestWeight = 0;
+  let bestStops: RouteStop[] = [];
+  let bestDist = 0;
+  let bestIsMulti = false;
+
+  // Anchors to try
+  const anchors = sameLocationOnly ? [sorted[0]] : sorted;
+
+  for (let aIdx = 0; aIdx < anchors.length; aIdx++) {
+    const anchor = anchors[aIdx];
+
+    const candidatePool = sameLocationOnly
+      ? sorted
+      : sorted.filter((o) => {
+          if (o.id === anchor.id) return true;
+          const d = getDistanceBetweenPoints(anchor.lat, anchor.lon, o.lat, o.lon, cachedMatrix);
+          return d <= maxRadiusKm;
+        });
+
+    const otherCandidates = candidatePool.filter((o) => o.id !== anchor.id);
+
+    function branch(idx: number, currentSet: OrderLineItem[], curWeight: number) {
+      if (curWeight >= minWeight && curWeight <= maxWeight + 0.0001) {
+        if (doOrdersOverlapSla(currentSet)) {
+          const route = buildRouteStops(currentSet, cachedMatrix);
+          if (sameLocationOnly || route.cumulativeDistanceKm <= maxRadiusKm) {
+            const isBetter =
+              curWeight > bestWeight + 0.0001 ||
+              (Math.abs(curWeight - bestWeight) < 0.0001 && bestSet !== null && currentSet.length > bestSet.length);
+
+            if (isBetter) {
+              bestWeight = curWeight;
+              bestSet = [...currentSet];
+              bestStops = route.stops;
+              bestDist = route.cumulativeDistanceKm;
+              bestIsMulti = route.isMultiDrop;
+            }
+
+            // Reached exact capacity
+            if (Math.abs(curWeight - maxWeight) < 0.001) {
+              return;
+            }
+          }
+        }
       }
-    }
 
-    if (currentWeight > maxWeight || index >= sorted.length) {
-      return null;
-    }
+      if (curWeight >= maxWeight || idx >= otherCandidates.length) {
+        return;
+      }
 
-    for (let i = index; i < sorted.length; i++) {
-      const item = sorted[i];
-      if (currentWeight + item.invQt <= maxWeight) {
-        const nextSet = [...currentSet, item];
-        if (doOrdersOverlapSla(nextSet)) {
-          const res = search(i + 1, currentWeight + item.invQt, nextSet);
-          if (res) return res;
+      for (let i = idx; i < otherCandidates.length; i++) {
+        const item = otherCandidates[i];
+        if (curWeight + item.invQt <= maxWeight + 0.001) {
+          branch(i + 1, [...currentSet, item], curWeight + item.invQt);
         }
       }
     }
 
-    return null;
+    branch(0, [anchor], anchor.invQt);
+
+    if (bestSet && Math.abs(bestWeight - maxWeight) < 0.001) {
+      break;
+    }
   }
 
-  return search(0, 0, []);
+  if (bestSet && bestWeight >= minWeight) {
+    return {
+      orders: bestSet,
+      totalWeight: Math.round(bestWeight * 100) / 100,
+      stops: bestStops,
+      cumulativeDistanceKm: Math.round(bestDist * 100) / 100,
+      isMultiDrop: bestIsMulti,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Finds the optimal subset of candidate orders that fills a vehicle type
+ */
+export function findBestSubsetForVehicle(
+  candidateOrders: OrderLineItem[],
+  vType: VehicleType,
+  config: OptimizationConfig,
+  cachedMatrix?: DistanceMatrixData | null,
+  requireSameLocation: boolean = false
+): BestSubsetResult | null {
+  if (candidateOrders.length === 0) return null;
+
+  const minWeight = getMinWeightForVehicle(vType, config.enabledVehicleTypes);
+  const maxWeight = getMaxCapacityForVehicle(vType);
+
+  if (requireSameLocation) {
+    // Group candidate orders by location key
+    const locMap = new Map<string, OrderLineItem[]>();
+    for (const o of candidateOrders) {
+      const locKey = `${o.dest.trim().toLowerCase()}_${o.lat.toFixed(4)}_${o.lon.toFixed(4)}`;
+      if (!locMap.has(locKey)) locMap.set(locKey, []);
+      locMap.get(locKey)!.push(o);
+    }
+
+    let bestResult: BestSubsetResult | null = null;
+
+    for (const [, locOrders] of locMap.entries()) {
+      const result = searchOptimalSubset(locOrders, minWeight, maxWeight, config.maxMultiDropRadiusKm, cachedMatrix, true);
+      if (result) {
+        if (!bestResult || result.totalWeight > bestResult.totalWeight || (Math.abs(result.totalWeight - bestResult.totalWeight) < 0.001 && result.orders.length > bestResult.orders.length)) {
+          bestResult = result;
+        }
+      }
+    }
+
+    return bestResult;
+  }
+
+  return searchOptimalSubset(candidateOrders, minWeight, maxWeight, config.maxMultiDropRadiusKm, cachedMatrix, false);
 }
 
 /**
@@ -321,308 +428,166 @@ export async function runPayloadAndRouteOptimization(
     return `${type}MT_${vehicleCounters[type]}`;
   };
 
-  // ==========================================
-  // PHASE 1: Priority I Grouping (Same Dealer, Same Location)
-  // ==========================================
-  log('Priority I', 'Evaluating Priority I: Same Dealer & Same Destination groupings...', 'info');
+  // Enabled vehicle types sorted descending (35 MT -> 30 MT -> 25 MT)
+  // Ensures single larger vehicle is always prioritized over multiple smaller ones
+  const sortedVehicleTypes = (['35', '30', '25'] as VehicleType[]).filter((t) =>
+    config.enabledVehicleTypes.includes(t)
+  );
 
-  // Group remaining orders by Dealer + Dest
-  const p1Map = new Map<string, OrderLineItem[]>();
-  for (const o of orders) {
-    if (!remainingOrderIds.has(o.id)) continue;
-    const key = `${o.soldToParty.trim()}__${o.dest.trim()}_${o.lat.toFixed(4)}_${o.lon.toFixed(4)}`;
-    if (!p1Map.has(key)) {
-      p1Map.set(key, []);
-    }
-    p1Map.get(key)!.push(o);
-  }
+  // =========================================================================
+  // DEALER-LEVEL OPTIMIZATION (Priority I & Priority II with Vehicle Size Priority)
+  //
+  // For each vehicle type in descending order (35 MT -> 30 MT -> 25 MT):
+  //   1. Check Priority I (Same Dealer, Same Location) for eligible shipments
+  //   2. Check Priority II (Same Dealer, Multi-Drop within radius) for eligible shipments
+  //
+  // This guarantees:
+  // - A single larger vehicle (e.g. 35MT / 30MT) is always preferred over smaller vehicles (25MT)
+  // - Multi-item orders (e.g. 15+5+5=25 MT, 20+10=30 MT, 20+14=34 MT) maximize payload capacity
+  // - Priority I single-drop is preferred over Priority II multi-drop within the SAME vehicle class
+  // =========================================================================
+  log('Priority I & II', 'Evaluating dealer-level groupings (35MT -> 30MT -> 25MT)...', 'info');
 
-  for (const [key, groupOrders] of p1Map.entries()) {
-    let unassignedInGroup = groupOrders.filter((o) => remainingOrderIds.has(o.id));
-    if (unassignedInGroup.length === 0) continue;
+  for (const vType of sortedVehicleTypes) {
+    const maxCap = getMaxCapacityForVehicle(vType);
 
-    // Check SLA compatibility and partition into SLA clusters if needed
-    // Greedy bin pack within this exact dealer+location
-    let attempts = 0;
-    while (unassignedInGroup.length > 0 && attempts < 50) {
-      attempts++;
-      const currentUnassigned = unassignedInGroup.filter((o) => remainingOrderIds.has(o.id));
-      if (currentUnassigned.length === 0) break;
+    // 1. Try Priority I (Same Dealer, Same Location) for this vehicle type
+    let p1Found = true;
+    let p1Guard = 0;
+    while (p1Found && p1Guard < 100) {
+      p1Guard++;
+      p1Found = false;
 
-      let totalWeight = currentUnassigned.reduce((s, o) => s + o.invQt, 0);
-
-      // Check if entire group fits in a single vehicle
-      const directVehicle = selectBestVehicleForWeight(totalWeight, config.enabledVehicleTypes);
-
-      if (directVehicle && doOrdersOverlapSla(currentUnassigned)) {
-        const vId = getNextVehicleId(directVehicle);
-        const { stops, cumulativeDistanceKm, isMultiDrop } = buildRouteStops(currentUnassigned, cachedMatrix);
-
-        dispatchedBatches.push({
-          vehicleId: vId,
-          vehicleType: directVehicle,
-          capacityMT: getMaxCapacityForVehicle(directVehicle),
-          totalWeightMT: Math.round(totalWeight * 100) / 100,
-          utilizationPercent: Math.round((totalWeight / getMaxCapacityForVehicle(directVehicle)) * 1000) / 10,
-          priorityGroup: 'Priority I',
-          dealerId: currentUnassigned[0].soldToParty,
-          orders: currentUnassigned,
-          stops,
-          cumulativeMultiDropDistanceKm: cumulativeDistanceKm,
-          slaEarliestExpiry: new Date(Math.min(...currentUnassigned.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
-          slaLatestStart: new Date(Math.max(...currentUnassigned.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
-          isMultiDrop,
-        });
-
-        markOrdersAssigned(currentUnassigned, vId, directVehicle, 'Allocated via Priority I (Same Dealer, Same Location)', 'Priority I');
-        break;
+      // Group unassigned by dealer
+      const dealerMap = new Map<string, OrderLineItem[]>();
+      for (const o of orders) {
+        if (!remainingOrderIds.has(o.id)) continue;
+        const dealer = o.soldToParty.trim();
+        if (!dealerMap.has(dealer)) dealerMap.set(dealer, []);
+        dealerMap.get(dealer)!.push(o);
       }
 
-      // If group is larger than 35 MT or needs splitting (Large Weight Split rule):
-      // Try finding exact 35 MT, 30 MT, or 25 MT subsets
-      let subsetAllocated = false;
-      for (const vType of config.enabledVehicleTypes) {
-        const minW = getMinWeightForVehicle(vType);
-        const maxW = getMaxCapacityForVehicle(vType);
-
-        const subset = findSubsetForTargetCapacity(currentUnassigned, minW, maxW);
-        if (subset && subset.length > 0) {
-          const subWeight = subset.reduce((s, o) => s + o.invQt, 0);
+      for (const [dealer, dOrders] of dealerMap.entries()) {
+        const best = findBestSubsetForVehicle(dOrders, vType, config, cachedMatrix, true);
+        if (best) {
           const vId = getNextVehicleId(vType);
-          const { stops, cumulativeDistanceKm, isMultiDrop } = buildRouteStops(subset, cachedMatrix);
-
           dispatchedBatches.push({
             vehicleId: vId,
             vehicleType: vType,
-            capacityMT: maxW,
-            totalWeightMT: Math.round(subWeight * 100) / 100,
-            utilizationPercent: Math.round((subWeight / maxW) * 1000) / 10,
+            capacityMT: maxCap,
+            totalWeightMT: best.totalWeight,
+            utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
             priorityGroup: 'Priority I',
-            dealerId: subset[0].soldToParty,
-            orders: subset,
-            stops,
-            cumulativeMultiDropDistanceKm: cumulativeDistanceKm,
-            slaEarliestExpiry: new Date(Math.min(...subset.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
-            slaLatestStart: new Date(Math.max(...subset.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
-            isMultiDrop,
+            dealerId: dealer,
+            orders: best.orders,
+            stops: best.stops,
+            cumulativeMultiDropDistanceKm: best.cumulativeDistanceKm,
+            slaEarliestExpiry: new Date(Math.min(...best.orders.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
+            slaLatestStart: new Date(Math.max(...best.orders.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
+            isMultiDrop: best.isMultiDrop,
           });
 
-          markOrdersAssigned(subset, vId, vType, 'Allocated via Priority I split batch', 'Priority I');
-          subsetAllocated = true;
-          break;
+          markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority I (${vType}MT Same Location)`, 'Priority I');
+          p1Found = true;
+          break; // break to re-evaluate dealerMap with updated remaining orders
         }
       }
+    }
 
-      if (!subsetAllocated) {
-        // Cannot form any more >= 80% batches for this specific location alone
-        break;
+    // 2. Try Priority II (Same Dealer, Multi-Drop Locations) for this vehicle type
+    let p2Found = true;
+    let p2Guard = 0;
+    while (p2Found && p2Guard < 100) {
+      p2Guard++;
+      p2Found = false;
+
+      const dealerMap = new Map<string, OrderLineItem[]>();
+      for (const o of orders) {
+        if (!remainingOrderIds.has(o.id)) continue;
+        const dealer = o.soldToParty.trim();
+        if (!dealerMap.has(dealer)) dealerMap.set(dealer, []);
+        dealerMap.get(dealer)!.push(o);
       }
 
-      unassignedInGroup = currentUnassigned.filter((o) => remainingOrderIds.has(o.id));
-    }
-  }
+      for (const [dealer, dOrders] of dealerMap.entries()) {
+        if (dOrders.length <= 1) continue;
 
-  log('Priority I Completed', `Priority I allocated ${dispatchedBatches.length} shipments. Remaining orders: ${remainingOrderIds.size}`, 'info');
-
-  onProgress?.({
-    percent: 50,
-    step: '50% of data processed: Evaluating Priority II Multi-Drop (Same Dealer, Different Locations)...',
-    processedCount: orders.length - remainingOrderIds.size,
-    totalCount: orders.length,
-  });
-
-  // ==========================================
-  // PHASE 2: Priority II Grouping (Same Dealer, Multi-Drop Locations)
-  // ==========================================
-  log('Priority II', 'Evaluating Priority II: Same Dealer across different multi-drop locations within max radius...', 'info');
-
-  const p2DealerMap = new Map<string, OrderLineItem[]>();
-  for (const o of orders) {
-    if (!remainingOrderIds.has(o.id)) continue;
-    const dealer = o.soldToParty.trim();
-    if (!p2DealerMap.has(dealer)) {
-      p2DealerMap.set(dealer, []);
-    }
-    p2DealerMap.get(dealer)!.push(o);
-  }
-
-  for (const [dealer, dealerOrders] of p2DealerMap.entries()) {
-    let unassignedDealer = dealerOrders.filter((o) => remainingOrderIds.has(o.id));
-    if (unassignedDealer.length <= 1) continue;
-
-    let p2Attempts = 0;
-    while (unassignedDealer.length > 1 && p2Attempts < 40) {
-      p2Attempts++;
-      const currentUnassigned = unassignedDealer.filter((o) => remainingOrderIds.has(o.id));
-      if (currentUnassigned.length <= 1) break;
-
-      let matchedBatch: { orders: OrderLineItem[]; vehicleType: VehicleType; stops: RouteStop[]; cumDist: number } | null = null;
-
-      // Try largest vehicle types first
-      for (const vType of config.enabledVehicleTypes) {
-        const minW = getMinWeightForVehicle(vType);
-        const maxW = getMaxCapacityForVehicle(vType);
-
-        // Try combinations of 2 to 5 multi-drop orders
-        // Start from largest order as Stop 1 anchor
-        const sortedByWeight = [...currentUnassigned].sort((a, b) => b.invQt - a.invQt);
-        const anchor = sortedByWeight[0];
-
-        const candidatePool = sortedByWeight.filter(
-          (o) => o.id !== anchor.id &&
-          getDistanceBetweenPoints(anchor.lat, anchor.lon, o.lat, o.lon, cachedMatrix) <= config.maxMultiDropRadiusKm
-        );
-
-        // Greedy search for valid combination with anchor
-        let currentBatch = [anchor];
-        let curWeight = anchor.invQt;
-
-        for (const candidate of candidatePool) {
-          if (curWeight + candidate.invQt <= maxW) {
-            const testBatch = [...currentBatch, candidate];
-            if (doOrdersOverlapSla(testBatch)) {
-              const { stops, cumulativeDistanceKm } = buildRouteStops(testBatch, cachedMatrix);
-              if (cumulativeDistanceKm <= config.maxMultiDropRadiusKm) {
-                currentBatch = testBatch;
-                curWeight += candidate.invQt;
-              }
-            }
-          }
-        }
-
-        if (curWeight >= minW && curWeight <= maxW) {
-          const { stops, cumulativeDistanceKm } = buildRouteStops(currentBatch, cachedMatrix);
-          matchedBatch = {
-            orders: currentBatch,
+        const best = findBestSubsetForVehicle(dOrders, vType, config, cachedMatrix, false);
+        if (best) {
+          const vId = getNextVehicleId(vType);
+          dispatchedBatches.push({
+            vehicleId: vId,
             vehicleType: vType,
-            stops,
-            cumDist: cumulativeDistanceKm,
-          };
+            capacityMT: maxCap,
+            totalWeightMT: best.totalWeight,
+            utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
+            priorityGroup: 'Priority II',
+            dealerId: dealer,
+            orders: best.orders,
+            stops: best.stops,
+            cumulativeMultiDropDistanceKm: best.cumulativeDistanceKm,
+            slaEarliestExpiry: new Date(Math.min(...best.orders.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
+            slaLatestStart: new Date(Math.max(...best.orders.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
+            isMultiDrop: best.isMultiDrop,
+          });
+
+          markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority II (${vType}MT Same Dealer Multi-Drop)`, 'Priority II');
+          p2Found = true;
           break;
         }
-      }
-
-      if (matchedBatch) {
-        const vId = getNextVehicleId(matchedBatch.vehicleType);
-        const totalW = matchedBatch.orders.reduce((s, o) => s + o.invQt, 0);
-        const maxCap = getMaxCapacityForVehicle(matchedBatch.vehicleType);
-
-        dispatchedBatches.push({
-          vehicleId: vId,
-          vehicleType: matchedBatch.vehicleType,
-          capacityMT: maxCap,
-          totalWeightMT: Math.round(totalW * 100) / 100,
-          utilizationPercent: Math.round((totalW / maxCap) * 1000) / 10,
-          priorityGroup: 'Priority II',
-          dealerId: dealer,
-          orders: matchedBatch.orders,
-          stops: matchedBatch.stops,
-          cumulativeMultiDropDistanceKm: matchedBatch.cumDist,
-          slaEarliestExpiry: new Date(Math.min(...matchedBatch.orders.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
-          slaLatestStart: new Date(Math.max(...matchedBatch.orders.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
-          isMultiDrop: true,
-        });
-
-        markOrdersAssigned(matchedBatch.orders, vId, matchedBatch.vehicleType, 'Allocated via Priority II (Same Dealer Multi-Drop)', 'Priority II');
-        unassignedDealer = unassignedDealer.filter((o) => remainingOrderIds.has(o.id));
-      } else {
-        break;
       }
     }
   }
 
-  log('Priority II Completed', `Priority II finished. Total shipments so far: ${dispatchedBatches.length}. Remaining orders: ${remainingOrderIds.size}`, 'info');
+  log('Priority I & II Completed', `Priority I & II allocated ${dispatchedBatches.length} shipments. Remaining orders: ${remainingOrderIds.size}`, 'info');
 
   onProgress?.({
     percent: 75,
-    step: '80% of data processed: Evaluating Priority III (Cross-Dealer Multi-Drop)...',
+    step: '75% of data processed: Evaluating Priority III (Cross-Dealer Multi-Drop)...',
     processedCount: orders.length - remainingOrderIds.size,
     totalCount: orders.length,
   });
 
-  // ==========================================
+  // =========================================================================
   // PHASE 3: Priority III Grouping (Cross-Dealer Multi-Drop)
-  // ==========================================
-  log('Priority III', 'Evaluating Priority III: Cross-Dealer multi-drop route optimization...', 'info');
+  // Evaluates 35 MT -> 30 MT -> 25 MT across all remaining unassigned orders
+  // =========================================================================
+  log('Priority III', 'Evaluating Priority III: Cross-Dealer multi-drop route optimization (35MT -> 30MT -> 25MT)...', 'info');
 
-  let p3Unassigned = orders.filter((o) => remainingOrderIds.has(o.id));
-  let p3Attempts = 0;
+  for (const vType of sortedVehicleTypes) {
+    const maxCap = getMaxCapacityForVehicle(vType);
+    let p3Found = true;
+    let p3Guard = 0;
 
-  while (p3Unassigned.length > 1 && p3Attempts < 50) {
-    p3Attempts++;
-    const currentUnassigned = p3Unassigned.filter((o) => remainingOrderIds.has(o.id));
-    if (currentUnassigned.length <= 1) break;
+    while (p3Found && p3Guard < 100) {
+      p3Guard++;
+      p3Found = false;
 
-    // Pick largest remaining order as First Drop candidate
-    const sorted = [...currentUnassigned].sort((a, b) => b.invQt - a.invQt);
-    const anchor = sorted[0];
+      const currentUnassigned = orders.filter((o) => remainingOrderIds.has(o.id));
+      if (currentUnassigned.length <= 1) break;
 
-    // Find nearby orders within multi-drop radius
-    const nearbyCandidates = sorted.slice(1).filter((o) => {
-      const dist = getDistanceBetweenPoints(anchor.lat, anchor.lon, o.lat, o.lon, cachedMatrix);
-      return dist <= config.maxMultiDropRadiusKm;
-    });
-
-    let matchedP3Batch: { orders: OrderLineItem[]; vehicleType: VehicleType; stops: RouteStop[]; cumDist: number } | null = null;
-
-    for (const vType of config.enabledVehicleTypes) {
-      const minW = getMinWeightForVehicle(vType);
-      const maxW = getMaxCapacityForVehicle(vType);
-
-      let batch = [anchor];
-      let bWeight = anchor.invQt;
-
-      for (const candidate of nearbyCandidates) {
-        if (bWeight + candidate.invQt <= maxW) {
-          const testBatch = [...batch, candidate];
-          if (doOrdersOverlapSla(testBatch)) {
-            const { stops, cumulativeDistanceKm } = buildRouteStops(testBatch, cachedMatrix);
-            if (cumulativeDistanceKm <= config.maxMultiDropRadiusKm) {
-              batch = testBatch;
-              bWeight += candidate.invQt;
-            }
-          }
-        }
-      }
-
-      if (bWeight >= minW && bWeight <= maxW) {
-        const { stops, cumulativeDistanceKm } = buildRouteStops(batch, cachedMatrix);
-        matchedP3Batch = {
-          orders: batch,
+      const best = findBestSubsetForVehicle(currentUnassigned, vType, config, cachedMatrix, false);
+      if (best) {
+        const vId = getNextVehicleId(vType);
+        dispatchedBatches.push({
+          vehicleId: vId,
           vehicleType: vType,
-          stops,
-          cumDist: cumulativeDistanceKm,
-        };
-        break;
+          capacityMT: maxCap,
+          totalWeightMT: best.totalWeight,
+          utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
+          priorityGroup: 'Priority III',
+          dealerId: 'Multi-Dealer',
+          orders: best.orders,
+          stops: best.stops,
+          cumulativeMultiDropDistanceKm: best.cumulativeDistanceKm,
+          slaEarliestExpiry: new Date(Math.min(...best.orders.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
+          slaLatestStart: new Date(Math.max(...best.orders.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
+          isMultiDrop: best.isMultiDrop,
+        });
+
+        markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority III (${vType}MT Cross-Dealer Multi-Drop)`, 'Priority III');
+        p3Found = true;
       }
-    }
-
-    if (matchedP3Batch) {
-      const vId = getNextVehicleId(matchedP3Batch.vehicleType);
-      const totalW = matchedP3Batch.orders.reduce((s, o) => s + o.invQt, 0);
-      const maxCap = getMaxCapacityForVehicle(matchedP3Batch.vehicleType);
-
-      dispatchedBatches.push({
-        vehicleId: vId,
-        vehicleType: matchedP3Batch.vehicleType,
-        capacityMT: maxCap,
-        totalWeightMT: Math.round(totalW * 100) / 100,
-        utilizationPercent: Math.round((totalW / maxCap) * 1000) / 10,
-        priorityGroup: 'Priority III',
-        dealerId: 'Multi-Dealer',
-        orders: matchedP3Batch.orders,
-        stops: matchedP3Batch.stops,
-        cumulativeMultiDropDistanceKm: matchedP3Batch.cumDist,
-        slaEarliestExpiry: new Date(Math.min(...matchedP3Batch.orders.map((o) => o.calculatedSla?.expiryTimestamp ?? Infinity))).toLocaleTimeString(),
-        slaLatestStart: new Date(Math.max(...matchedP3Batch.orders.map((o) => o.calculatedSla?.effectiveStartTimestamp ?? 0))).toLocaleTimeString(),
-        isMultiDrop: true,
-      });
-
-      markOrdersAssigned(matchedP3Batch.orders, vId, matchedP3Batch.vehicleType, 'Allocated via Priority III (Cross-Dealer Multi-Drop)', 'Priority III');
-      p3Unassigned = p3Unassigned.filter((o) => remainingOrderIds.has(o.id));
-    } else {
-      // Could not batch this anchor under Priority III, remove from priority iteration
-      p3Unassigned = p3Unassigned.filter((o) => o.id !== anchor.id);
     }
   }
 
