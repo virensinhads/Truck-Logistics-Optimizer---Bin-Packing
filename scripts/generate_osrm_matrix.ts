@@ -3,15 +3,30 @@
  * LOCAL OSRM DISTANCE MATRIX GENERATOR SCRIPT
  * ==============================================================================================
  * 
+ * INPUT FILE FIELD MAPPING SUPPORTED:
+ * ----------------------------------------------------------------------------------------------
+ * Column Header            | Field Description                  | Data Type / Format
+ * ----------------------------------------------------------------------------------------------
+ * Inv Qt.(MT)              | Order Weight / Quantity            | Numeric (Float)
+ * SO/PO Date               | Order Placement Date               | Date in DD/MM/YYYY format
+ * SO/STO creation time     | Order Placement Time               | Time (HH:MM:SS)
+ * Sold to Party (dealer)   | Unique Dealer ID                   | String / Text
+ * Ship To Party Name       | Sub-dealer / Secondary Receiver    | String / Text
+ * Dest.                    | Destination Name                   | String / Text
+ * Lat                      | Destination Latitude               | Coordinate (Float)
+ * Lon                      | Destination Longitude              | Coordinate (Float)
+ * ----------------------------------------------------------------------------------------------
+ * 
  * DESCRIPTION:
- * Reads a Sales Register (Excel/CSV) or location list, extracts unique destination coordinates (lon, lat),
- * constructs all coordinates in OSRM Table format, and queries your local OSRM instance:
+ * Reads a Sales Register (Excel/CSV) using the exact field mapping above, extracts unique 
+ * destination coordinates (Lon, Lat) alongside destination names, constructs all coordinates 
+ * in OSRM Table format, and queries your local OSRM instance:
  * 
  * URL pattern:
  * http://localhost:5001/table/v1/driving/{lon1},{lat1};{lon2},{lat2};...;{lonN},{latN}?annotations=distance,duration&sources={i}
  * 
  * It rotates the source index `sources=0` to `sources=n-1` to calculate the full NxN distance matrix,
- * then generates an Excel file formatted with 'Pairwise Distances' and 'Distance Matrix (km)' sheets,
+ * then generates an Excel file with 'Pairwise Distances', 'Distance Matrix (km)', and 'Unique Locations' sheets,
  * which can be directly uploaded into the web app's "Upload Distance Matrix" feature!
  * 
  * ----------------------------------------------------------------------------------------------
@@ -27,8 +42,8 @@
  * Option A (Using npx tsx directly - RECOMMENDED):
  *   npx tsx scripts/generate_osrm_matrix.ts <path-to-sales-register.xlsx> [output-matrix.xlsx] [osrm-url]
  * 
- * Option B (Using node if compiled):
- *   node scripts/generate_osrm_matrix.mjs <path-to-sales-register.xlsx>
+ * Option B (Using npm script):
+ *   npm run generate-matrix -- <path-to-sales-register.xlsx> [output-matrix.xlsx] [osrm-url]
  * 
  * Examples:
  *   npx tsx scripts/generate_osrm_matrix.ts ./sales_register.xlsx
@@ -47,6 +62,37 @@ interface LocationPoint {
   name: string;
   lat: number;
   lon: number;
+  dealers: string[];
+  shipToParties: string[];
+}
+
+/**
+ * Normalizes column lookup to match exact headers or common casing/trim variations
+ */
+function findRowValue(row: Record<string, any>, targetKeys: string[]): any {
+  const rowKeys = Object.keys(row);
+
+  // Exact matching first
+  for (const targetKey of targetKeys) {
+    if (row[targetKey] !== undefined && row[targetKey] !== null && row[targetKey] !== '') {
+      return row[targetKey];
+    }
+  }
+
+  // Alphanumeric case-insensitive normalized matching
+  for (const targetKey of targetKeys) {
+    const cleanTarget = targetKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const k of rowKeys) {
+      const cleanK = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (cleanK === cleanTarget) {
+        if (row[k] !== undefined && row[k] !== null && row[k] !== '') {
+          return row[k];
+        }
+      }
+    }
+  }
+
+  return undefined;
 }
 
 // Helper to normalize location key
@@ -71,7 +117,17 @@ function computeHaversineDistanceKm(lat1: number, lon1: number, lat2: number, lo
   return straightDist * 1.3; // 1.3x circuity factor
 }
 
-// Read and parse input file (Excel or CSV)
+/**
+ * Read and parse input sales register file (Excel or CSV) based on exact field mapping:
+ * - Inv Qt.(MT)
+ * - SO/PO Date
+ * - SO/STO creation time
+ * - Sold to Party (dealer)
+ * - Ship To Party Name
+ * - Dest.
+ * - Lat
+ * - Lon
+ */
 function parseLocationsFromInput(filePath: string): LocationPoint[] {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Input file not found at path: ${filePath}`);
@@ -89,47 +145,44 @@ function parseLocationsFromInput(filePath: string): LocationPoint[] {
 
   const locationMap = new Map<string, LocationPoint>();
 
-  for (const row of rows) {
-    // Find Lat & Lon columns
-    const latKeys = ['Destination Lat', 'Dest Lat', 'Latitude', 'Lat', 'lat', 'LAT', 'From Lat', 'To Lat'];
-    const lonKeys = ['Destination Long', 'Dest Lon', 'Longitude', 'Long', 'Lon', 'lon', 'LON', 'From Lon', 'To Lon'];
-    const nameKeys = ['Destination Name', 'Destination', 'Dest', 'City', 'Location', 'Dealer Name', 'From Location', 'To Location'];
+  for (let idx = 0; idx < rows.length; idx++) {
+    const row = rows[idx];
 
-    let rawLat: any = undefined;
-    let rawLon: any = undefined;
-    let name: string = '';
+    // Map exact specified columns
+    const rawLat = findRowValue(row, ['Lat', 'Destination Latitude', 'Latitude', 'dest_lat', 'Destination Lat']);
+    const rawLon = findRowValue(row, ['Lon', 'Destination Longitude', 'Longitude', 'Long', 'dest_lon', 'Destination Lon']);
+    const rawDest = findRowValue(row, ['Dest.', 'Dest', 'Destination Name', 'Destination', 'Location', 'City']);
+    const rawDealer = findRowValue(row, ['Sold to Party (dealer)', 'Sold to Party', 'Dealer', 'Dealer ID']);
+    const rawShipTo = findRowValue(row, ['Ship To Party Name', 'Ship to Party', 'Receiver', 'Consignee']);
 
-    for (const k of latKeys) {
-      if (row[k] !== undefined && row[k] !== '') {
-        rawLat = row[k];
-        break;
-      }
-    }
-    for (const k of lonKeys) {
-      if (row[k] !== undefined && row[k] !== '') {
-        rawLon = row[k];
-        break;
-      }
-    }
-    for (const k of nameKeys) {
-      if (row[k] !== undefined && row[k] !== '') {
-        name = String(row[k]).trim();
-        break;
-      }
-    }
-
-    const lat = parseFloat(String(rawLat));
-    const lon = parseFloat(String(rawLon));
+    const lat = parseFloat(String(rawLat).replace(/,/g, ''));
+    const lon = parseFloat(String(rawLon).replace(/,/g, ''));
+    const destName = String(rawDest || '').trim();
+    const dealerName = String(rawDealer || '').trim();
+    const shipToName = String(rawShipTo || '').trim();
 
     if (!isNaN(lat) && !isNaN(lon)) {
       const key = getLocationKey(lat, lon);
       if (!locationMap.has(key)) {
         locationMap.set(key, {
           key,
-          name: name || `Loc (${lat.toFixed(3)}, ${lon.toFixed(3)})`,
+          name: destName || `Location (${lat.toFixed(3)}, ${lon.toFixed(3)})`,
           lat,
           lon,
+          dealers: dealerName ? [dealerName] : [],
+          shipToParties: shipToName ? [shipToName] : [],
         });
+      } else {
+        const existing = locationMap.get(key)!;
+        if (!existing.name && destName) {
+          existing.name = destName;
+        }
+        if (dealerName && !existing.dealers.includes(dealerName)) {
+          existing.dealers.push(dealerName);
+        }
+        if (shipToName && !existing.shipToParties.includes(shipToName)) {
+          existing.shipToParties.push(shipToName);
+        }
       }
     }
   }
@@ -137,7 +190,9 @@ function parseLocationsFromInput(filePath: string): LocationPoint[] {
   return Array.from(locationMap.values());
 }
 
-// Call local OSRM instance
+/**
+ * Call local OSRM instance table endpoint with source rotation
+ */
 async function queryLocalOSRM(
   osrmBaseUrl: string,
   locations: LocationPoint[],
@@ -206,6 +261,16 @@ async function main() {
 ==================================================================================
 LOCAL OSRM DISTANCE MATRIX GENERATOR
 ==================================================================================
+Supported Input Field Mapping:
+  - Inv Qt.(MT)              : Order Weight / Quantity (Float)
+  - SO/PO Date               : Order Placement Date (DD/MM/YYYY)
+  - SO/STO creation time     : Order Placement Time (HH:MM:SS)
+  - Sold to Party (dealer)   : Unique Dealer ID
+  - Ship To Party Name       : Sub-dealer / Receiver
+  - Dest.                    : Destination Name
+  - Lat                      : Destination Latitude (Float)
+  - Lon                      : Destination Longitude (Float)
+
 Usage:
   npx tsx scripts/generate_osrm_matrix.ts <inputFile> [outputFile] [osrmBaseUrl]
 
@@ -243,7 +308,7 @@ Examples:
   console.log(`✅ Found ${n} unique destination locations (${n * n} pairwise road combinations).\n`);
 
   if (n === 0) {
-    console.error(`❌ Error: No valid coordinates found in ${inputFilePath}.`);
+    console.error(`❌ Error: No valid coordinates found in ${inputFilePath}. Please ensure 'Lat' and 'Lon' columns exist.`);
     process.exit(1);
   }
 
@@ -341,10 +406,12 @@ Examples:
   // Sheet 3: Locations Reference
   const locRows = locations.map((loc, idx) => ({
     'Index (Source ID)': idx,
-    'Location Name': loc.name,
-    'Coordinates': loc.key,
-    'Latitude': loc.lat,
-    'Longitude': loc.lon,
+    'Destination (Dest.)': loc.name,
+    'Coordinates (Lat, Lon)': loc.key,
+    'Lat': loc.lat,
+    'Lon': loc.lon,
+    'Associated Dealers': loc.dealers.join(', '),
+    'Associated Ship-To Parties': loc.shipToParties.join(', '),
   }));
   const wsLocs = XLSX.utils.json_to_sheet(locRows);
   XLSX.utils.book_append_sheet(wb, wsLocs, 'Unique Locations');
