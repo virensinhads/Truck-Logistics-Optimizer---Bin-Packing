@@ -29,6 +29,27 @@ interface CandidateGroup {
 }
 
 /**
+ * Determines the exact, intrinsic priority allocation of an allocated vehicle shipment batch:
+ * - Priority I: Single Dealer + Single Destination (Direct FTL or clubbed orders at same location)
+ * - Priority II: Single Dealer + Multi-Drop Destinations (Same dealer across multiple locations within permissible radius)
+ * - Priority III: Cross-Dealer Multi-Drop (Clubbed orders across different dealers within permissible radius)
+ */
+export function determineBatchPriority(orders: OrderLineItem[]): 'Priority I' | 'Priority II' | 'Priority III' {
+  const uniqueDealers = new Set(orders.map((o) => (o.soldToParty || '').trim().toLowerCase()));
+  const uniqueDestKeys = new Set(
+    orders.map((o) => `${(o.dest || '').trim().toLowerCase()}_${o.lat.toFixed(4)}_${o.lon.toFixed(4)}`)
+  );
+
+  if (uniqueDealers.size <= 1 && uniqueDestKeys.size <= 1) {
+    return 'Priority I';
+  } else if (uniqueDealers.size <= 1 && uniqueDestKeys.size > 1) {
+    return 'Priority II';
+  } else {
+    return 'Priority III';
+  }
+}
+
+/**
  * Returns the minimum threshold required for a vehicle type to satisfy >80% utilization
  */
 export function getMinWeightForVehicle(type: VehicleType, enabledTypes?: VehicleType[]): number {
@@ -471,13 +492,14 @@ export async function runPayloadAndRouteOptimization(
         const best = findBestSubsetForVehicle(dOrders, vType, config, cachedMatrix, true);
         if (best) {
           const vId = getNextVehicleId(vType);
+          const priority = determineBatchPriority(best.orders);
           dispatchedBatches.push({
             vehicleId: vId,
             vehicleType: vType,
             capacityMT: maxCap,
             totalWeightMT: best.totalWeight,
             utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
-            priorityGroup: 'Priority I',
+            priorityGroup: priority,
             dealerId: dealer,
             orders: best.orders,
             stops: best.stops,
@@ -487,7 +509,7 @@ export async function runPayloadAndRouteOptimization(
             isMultiDrop: best.isMultiDrop,
           });
 
-          markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority I (${vType}MT Same Location)`, 'Priority I');
+          markOrdersAssigned(best.orders, vId, vType, `Allocated via ${priority} (${vType}MT Same Location)`, priority);
           p1Found = true;
           break; // break to re-evaluate dealerMap with updated remaining orders
         }
@@ -515,13 +537,14 @@ export async function runPayloadAndRouteOptimization(
         const best = findBestSubsetForVehicle(dOrders, vType, config, cachedMatrix, false);
         if (best) {
           const vId = getNextVehicleId(vType);
+          const priority = determineBatchPriority(best.orders);
           dispatchedBatches.push({
             vehicleId: vId,
             vehicleType: vType,
             capacityMT: maxCap,
             totalWeightMT: best.totalWeight,
             utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
-            priorityGroup: 'Priority II',
+            priorityGroup: priority,
             dealerId: dealer,
             orders: best.orders,
             stops: best.stops,
@@ -531,7 +554,7 @@ export async function runPayloadAndRouteOptimization(
             isMultiDrop: best.isMultiDrop,
           });
 
-          markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority II (${vType}MT Same Dealer Multi-Drop)`, 'Priority II');
+          markOrdersAssigned(best.orders, vId, vType, `Allocated via ${priority} (${vType}MT ${priority === 'Priority I' ? 'Same Location' : 'Same Dealer Multi-Drop'})`, priority);
           p2Found = true;
           break;
         }
@@ -569,14 +592,15 @@ export async function runPayloadAndRouteOptimization(
       const best = findBestSubsetForVehicle(currentUnassigned, vType, config, cachedMatrix, false);
       if (best) {
         const vId = getNextVehicleId(vType);
+        const priority = determineBatchPriority(best.orders);
         dispatchedBatches.push({
           vehicleId: vId,
           vehicleType: vType,
           capacityMT: maxCap,
           totalWeightMT: best.totalWeight,
           utilizationPercent: Math.round((best.totalWeight / maxCap) * 1000) / 10,
-          priorityGroup: 'Priority III',
-          dealerId: 'Multi-Dealer',
+          priorityGroup: priority,
+          dealerId: priority === 'Priority III' ? 'Multi-Dealer' : (best.orders[0]?.soldToParty || 'Single-Dealer'),
           orders: best.orders,
           stops: best.stops,
           cumulativeMultiDropDistanceKm: best.cumulativeDistanceKm,
@@ -585,7 +609,7 @@ export async function runPayloadAndRouteOptimization(
           isMultiDrop: best.isMultiDrop,
         });
 
-        markOrdersAssigned(best.orders, vId, vType, `Allocated via Priority III (${vType}MT Cross-Dealer Multi-Drop)`, 'Priority III');
+        markOrdersAssigned(best.orders, vId, vType, `Allocated via ${priority} (${vType}MT Multi-Drop)`, priority);
         p3Found = true;
       }
     }
