@@ -12,10 +12,10 @@ import {
   Info,
   Check,
   FileUp,
-  HelpCircle,
   Download,
-  Server,
-  Terminal,
+  FileText,
+  Truck,
+  ArrowRight,
 } from 'lucide-react';
 import { DistanceMatrixData, LocationPoint, OrderLineItem } from '../types';
 import {
@@ -24,11 +24,7 @@ import {
   exportDistanceMatrixToExcel,
   exportDistanceMatrixToJson,
   saveDistanceMatrixToStorage,
-  saveOsrmBaseUrlToStorage,
-  loadOsrmBaseUrlFromStorage,
   DEFAULT_OSRM_URL,
-  FALLBACK_PUBLIC_OSM_URL,
-  getLocationKey,
 } from '../utils/distanceMatrixEngine';
 import { SAMPLE_SALES_REGISTER_ORDERS } from '../utils/sampleData';
 import {
@@ -52,7 +48,9 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 }) => {
   const [isRunning, setIsRunning] = useState(false);
   const [isUploadingMatrix, setIsUploadingMatrix] = useState(false);
-  const [osrmUrl, setOsrmUrl] = useState<string>(() => loadOsrmBaseUrlFromStorage() || DEFAULT_OSRM_URL);
+  const [uploadedSalesFileName, setUploadedSalesFileName] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+
   const [progress, setProgress] = useState<{
     percent: number;
     step: string;
@@ -60,8 +58,6 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     totalPairs: number;
     currentSourceIndex: number;
     totalSources: number;
-    currentSourceLocation?: LocationPoint;
-    currentUrl?: string;
     tierCounts: { osrmTable: number; osmTable: number; osmRoute: number; haversine: number };
   }>({
     percent: 0,
@@ -78,6 +74,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
   const [editValue, setEditValue] = useState<string>('');
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
+  const salesFileInputRef = useRef<HTMLInputElement>(null);
   const matrixFileInputRef = useRef<HTMLInputElement>(null);
 
   // Derive unique locations from activeOrders or sample data
@@ -88,27 +85,10 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     return extractUniqueLocations(SAMPLE_SALES_REGISTER_ORDERS);
   }, [activeOrders]);
 
-  // Generate sample URL for UI reference matching user's exact specification
-  const sampleUrlPreview = useMemo(() => {
-    const cleanBase = (osrmUrl || DEFAULT_OSRM_URL).replace(/\/+$/, '');
-    if (currentLocations.length >= 2) {
-      const loc1 = currentLocations[0];
-      const loc2 = currentLocations[1];
-      return `${cleanBase}/table/v1/driving/${loc1.lon},${loc1.lat};${loc2.lon},${loc2.lat}?annotations=distance,duration&sources=0`;
-    }
-    return `${cleanBase}/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0`;
-  }, [osrmUrl, currentLocations]);
-
-  // Handle URL change & persist
-  const handleOsrmUrlChange = (newUrl: string) => {
-    setOsrmUrl(newUrl);
-    saveOsrmBaseUrlToStorage(newUrl);
-  };
-
-  // Execute Script 1 (Live OSRM Table evaluation with sources=0..N-1 rotation)
+  // Execute Distance Matrix Engine (Script 1: OSRM Table evaluation with sources=0..N-1)
   const handleRunScript1 = async () => {
     if (currentLocations.length === 0) {
-      setStatusMessage({ text: 'No valid coordinates found to compute matrix.', type: 'error' });
+      setStatusMessage({ text: 'No valid destination coordinates found to evaluate distance matrix.', type: 'error' });
       return;
     }
 
@@ -117,7 +97,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 
     try {
       const matrixData = await generateDistanceMatrix(currentLocations, {
-        osrmBaseUrl: osrmUrl,
+        osrmBaseUrl: DEFAULT_OSRM_URL,
         onProgress: (p) => {
           setProgress(p);
         },
@@ -130,12 +110,12 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
       const havCount = matrixData.stats.haversinePairs;
 
       setStatusMessage({
-        text: `Success! Distance matrix evaluated for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs across ${matrixData.locations.length} source requests). [OSRM Server: ${osrmCount} pairs, Public OSM: ${osmCount} pairs, Haversine Fallback: ${havCount} pairs]. Saved as active matrix!`,
+        text: `Success! Distance matrix evaluated for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs across ${matrixData.locations.length} source evaluations). [OSRM: ${osrmCount} pairs, OSM: ${osmCount} pairs, Haversine: ${havCount} pairs]. Saved as active matrix!`,
         type: 'success',
       });
     } catch (err: any) {
       setStatusMessage({
-        text: `Error generating distance matrix: ${err?.message || 'Unknown error'}`,
+        text: `Error evaluating distance matrix: ${err?.message || 'Unknown error'}`,
         type: 'error',
       });
     } finally {
@@ -143,25 +123,50 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     }
   };
 
-  // Handle uploaded sales register to extract coordinates
-  const handleSalesRegisterUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  // Helper to process sales register file
+  const processSalesFile = async (file: File) => {
     try {
       const orders = await parseSalesRegisterFile(file);
       setActiveOrders(orders);
+      setUploadedSalesFileName(file.name);
+      const uniqueLocs = extractUniqueLocations(orders);
       setStatusMessage({
-        text: `Loaded ${orders.length} orders from ${file.name}. Found ${extractUniqueLocations(orders).length} unique coordinate locations.`,
+        text: `Loaded ${orders.length} orders from "${file.name}". Identified ${uniqueLocs.length} unique destination locations. Ready for evaluation.`,
         type: 'success',
       });
     } catch (err: any) {
       setStatusMessage({
-        text: `Failed to read sales register: ${err?.message || 'Invalid format'}`,
+        text: `Failed to read Sales Register: ${err?.message || 'Invalid format'}`,
         type: 'error',
       });
-    } finally {
-      e.target.value = '';
+    }
+  };
+
+  // Handle uploaded sales register from input
+  const handleSalesRegisterUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await processSalesFile(file);
+    e.target.value = '';
+  };
+
+  // Handle Drag and Drop for Sales Register
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingFile(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+  };
+
+  const handleDropFile = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      await processSalesFile(file);
     }
   };
 
@@ -234,42 +239,121 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 
   return (
     <div className="space-y-4 max-w-7xl mx-auto px-4 sm:px-6 py-5 font-sans">
-      {/* Top Banner & Script 1 Info */}
+      {/* Top Banner & Header */}
       <div className="bg-white rounded-lg border border-[#E2E8F0] shadow-2xs p-4 sm:p-5 relative overflow-hidden">
-        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-          <div className="space-y-1.5 max-w-3xl">
-            <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-xs bg-[#0F172A] text-[#38BDF8] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#334155]">
-              <Sparkles className="w-3 h-3 text-[#38BDF8]" />
-              <span>Script 1: OSRM Distance Matrix Engine</span>
+        <div className="space-y-1.5 max-w-3xl">
+          <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-xs bg-[#0F172A] text-[#38BDF8] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#334155]">
+            <Sparkles className="w-3 h-3 text-[#38BDF8]" />
+            <span>Script 1: Distance Matrix Engine</span>
+          </div>
+          <h1 className="text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
+            Distance Matrix Management &amp; Evaluation
+          </h1>
+          <p className="text-xs text-[#64748B] font-mono leading-relaxed">
+            Evaluates the pairwise road distance matrix (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">km</code>) across all destinations for multi-drop route optimization and SLA calculation.
+          </p>
+        </div>
+
+        {/* Sales Register Attachment Upload Box */}
+        <div className="mt-4 pt-4 border-t border-[#E2E8F0] space-y-3">
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDropFile}
+            onClick={() => salesFileInputRef.current?.click()}
+            className={`p-4 sm:p-5 rounded-lg border-2 border-dashed transition flex flex-col sm:flex-row items-center justify-between gap-4 cursor-pointer ${
+              isDraggingFile
+                ? 'border-[#0284C7] bg-[#F0F9FF]'
+                : uploadedSalesFileName
+                ? 'border-[#86EFAC] bg-[#F0FDF4]'
+                : 'border-[#CBD5E1] bg-[#F8FAFC] hover:border-[#0284C7] hover:bg-[#F0F9FF]'
+            }`}
+          >
+            <div className="flex items-center gap-3 text-left">
+              <div
+                className={`w-10 h-10 rounded-md flex items-center justify-center shrink-0 ${
+                  uploadedSalesFileName
+                    ? 'bg-[#16A34A] text-white'
+                    : 'bg-[#0F172A] text-[#38BDF8]'
+                }`}
+              >
+                {uploadedSalesFileName ? (
+                  <CheckCircle2 className="w-5 h-5" />
+                ) : (
+                  <Upload className="w-5 h-5" />
+                )}
+              </div>
+              <div className="space-y-0.5">
+                <div className="text-xs font-bold font-mono text-[#0F172A]">
+                  Upload the Sales Register from which you would like to evaluate destination distance matrix, Header format for same can be fetched from Tab 2
+                </div>
+                <div className="text-[11px] text-[#64748B] font-mono">
+                  {uploadedSalesFileName ? (
+                    <span className="text-[#166534] font-semibold">
+                      Loaded file: <strong>{uploadedSalesFileName}</strong> ({activeOrders.length} orders, {currentLocations.length} unique destinations)
+                    </span>
+                  ) : (
+                    <span>Drag and drop your sales register file here, or click to browse (.xlsx, .xls, .csv)</span>
+                  )}
+                </div>
+              </div>
             </div>
-            <h1 className="text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
-              Distance Matrix Management &amp; Evaluation
-            </h1>
-            <p className="text-xs text-[#64748B] font-mono leading-relaxed">
-              Calculates the full <strong className="text-[#0F172A]">N&times;N road distance matrix</strong> by evaluating distance for each of the <strong className="text-[#0F172A]">N sources</strong> (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">sources=0..N-1</code>) via OSRM table endpoints. You can run against your local/network OSRM server, public OSM router, or upload a custom Excel matrix file.
-            </p>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                salesFileInputRef.current?.click();
+              }}
+              className="px-3.5 py-1.5 bg-white hover:bg-[#F1F5F9] text-[#0F172A] border border-[#CBD5E1] rounded-sm text-xs font-mono font-bold shrink-0 shadow-2xs cursor-pointer"
+            >
+              {uploadedSalesFileName ? 'Change File' : 'Browse File'}
+            </button>
+            <input
+              ref={salesFileInputRef}
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={handleSalesRegisterUpload}
+              className="hidden"
+            />
           </div>
 
-          {/* Action Trigger Box */}
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Download Sample Format */}
+          {/* Action Buttons Row */}
+          <div className="flex flex-wrap items-center gap-2.5 pt-1">
+            {/* 1. Evaluate distance for uploaded file */}
             <button
-              id="btn-download-matrix-sample"
+              id="btn-evaluate-matrix"
+              onClick={handleRunScript1}
+              disabled={isRunning}
+              className={`flex items-center justify-center gap-2 px-4 py-2 rounded-sm text-xs font-mono font-bold uppercase tracking-wider transition shadow-2xs cursor-pointer ${
+                isRunning
+                  ? 'bg-[#94A3B8] text-white cursor-not-allowed opacity-75'
+                  : 'bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155]'
+              }`}
+              title="Evaluate distance matrix for all destinations in the uploaded sales register"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin text-[#38BDF8]' : ''}`} />
+              <span>{isRunning ? 'Evaluating...' : 'Evaluate distance for uploaded file'}</span>
+            </button>
+
+            {/* 2. Sample Matrix Template for Upload */}
+            <button
+              id="btn-sample-matrix-template"
               onClick={handleDownloadSampleFormat}
-              className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#F8FAFC] hover:bg-[#F1F5F9] text-[#334155] rounded-sm text-xs font-mono font-semibold cursor-pointer border border-[#CBD5E1] transition shadow-2xs"
+              className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-[#F8FAFC] hover:bg-[#F1F5F9] text-[#334155] rounded-sm text-xs font-mono font-semibold cursor-pointer border border-[#CBD5E1] transition shadow-2xs"
               title="Download sample Excel format template to fill custom distances"
             >
               <Download className="w-3.5 h-3.5 text-[#0284C7]" />
-              <span>Sample Matrix Template</span>
+              <span>Sample Matrix Template for Upload</span>
             </button>
 
-            {/* Upload Distance Matrix File */}
+            {/* 3. Upload Distance Matrix */}
             <label
               id="btn-upload-distance-matrix"
-              className={`flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#0284C7] hover:bg-[#0369A1] text-white rounded-sm text-xs font-mono font-bold cursor-pointer transition shadow-2xs ${
+              className={`flex items-center justify-center gap-1.5 px-3.5 py-2 bg-[#0284C7] hover:bg-[#0369A1] text-white rounded-sm text-xs font-mono font-bold cursor-pointer transition shadow-2xs ${
                 isUploadingMatrix ? 'opacity-70 cursor-not-allowed' : ''
               }`}
-              title="Upload your own custom distance matrix Excel file"
+              title="Upload your own custom pre-calculated distance matrix Excel file"
             >
               <FileUp className="w-3.5 h-3.5 text-white" />
               <span>{isUploadingMatrix ? 'Reading File...' : 'Upload Distance Matrix'}</span>
@@ -282,97 +366,6 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                 className="hidden"
               />
             </label>
-
-            {/* Evaluate via Live Script 1 API */}
-            <button
-              id="btn-run-script1"
-              onClick={handleRunScript1}
-              disabled={isRunning}
-              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 rounded-sm text-xs font-mono font-bold uppercase tracking-wider transition shadow-2xs cursor-pointer ${
-                isRunning
-                  ? 'bg-[#94A3B8] text-white cursor-not-allowed opacity-75'
-                  : 'bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155]'
-              }`}
-              title="Compute distance matrix rotating sources=0..N-1 using OSRM Table API"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin text-[#38BDF8]' : ''}`} />
-              <span>{isRunning ? 'Evaluating...' : 'Evaluate via OSRM (Script 1)'}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* OSRM Server Endpoint Configuration & Live URL Preview */}
-        <div className="mt-4 pt-3 border-t border-[#E2E8F0] space-y-2.5 font-mono">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-2.5 bg-[#F8FAFC] p-3 rounded-md border border-[#E2E8F0]">
-            <div className="flex items-center gap-2 text-xs font-bold text-[#0F172A] shrink-0">
-              <Server className="w-4 h-4 text-[#0284C7]" />
-              <span>OSRM Server URL:</span>
-            </div>
-
-            <div className="flex flex-1 items-center gap-2">
-              <input
-                id="input-osrm-url"
-                type="text"
-                value={osrmUrl}
-                onChange={(e) => handleOsrmUrlChange(e.target.value)}
-                placeholder="http://192.168.157.174:5001"
-                className="flex-1 px-2.5 py-1 text-xs font-mono rounded-sm border border-[#CBD5E1] bg-white text-[#0F172A] focus:outline-hidden focus:border-[#38BDF8]"
-              />
-
-              {/* Quick Preset Buttons */}
-              <div className="flex items-center gap-1 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => handleOsrmUrlChange('http://192.168.157.174:5001')}
-                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
-                    osrmUrl === 'http://192.168.157.174:5001'
-                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
-                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
-                  }`}
-                  title="Use 192.168.157.174:5001"
-                >
-                  192.168.157.174
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleOsrmUrlChange('http://localhost:5001')}
-                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
-                    osrmUrl === 'http://localhost:5001'
-                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
-                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
-                  }`}
-                  title="Use localhost:5001"
-                >
-                  localhost
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleOsrmUrlChange(FALLBACK_PUBLIC_OSM_URL)}
-                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
-                    osrmUrl === FALLBACK_PUBLIC_OSM_URL
-                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
-                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
-                  }`}
-                  title="Use Public OpenStreetMap routing server"
-                >
-                  Public OSM
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Sample Table Request Pattern Display */}
-          <div className="bg-[#0F172A] text-[#94A3B8] p-2.5 rounded-md text-[11px] overflow-x-auto space-y-1">
-            <div className="flex items-center justify-between text-[#38BDF8] text-[10px] font-bold uppercase tracking-wider">
-              <span className="flex items-center gap-1">
-                <Terminal className="w-3 h-3" />
-                <span>Sample OSRM Query Pattern (Evaluates N Sources: sources=0..{Math.max(0, currentLocations.length - 1)})</span>
-              </span>
-              <span className="text-[#64748B]">GET /table/v1/driving</span>
-            </div>
-            <code className="text-[#38BDF8] text-[10px] block break-all select-all font-mono">
-              {sampleUrlPreview}
-            </code>
           </div>
         </div>
 
@@ -393,16 +386,11 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
               />
             </div>
             <div className="flex flex-wrap items-center justify-between text-[10px] text-[#64748B] pt-0.5">
-              <span>Source Query: {progress.currentSourceIndex}/{progress.totalSources}</span>
-              <span>OSRM Table Pairs: {progress.tierCounts.osrmTable}</span>
+              <span>Source Evaluation: {progress.currentSourceIndex}/{progress.totalSources}</span>
+              <span>OSRM Evaluated: {progress.tierCounts.osrmTable}</span>
               <span>Public OSM: {progress.tierCounts.osmTable}</span>
-              <span>Haversine 1.3x Fallback: {progress.tierCounts.haversine}</span>
+              <span>Haversine Fallback: {progress.tierCounts.haversine}</span>
             </div>
-            {progress.currentUrl && (
-              <div className="text-[9px] text-[#64748B] truncate bg-[#F8FAFC] p-1.5 rounded border border-[#E2E8F0]">
-                <strong className="text-[#0F172A]">Active Query:</strong> {progress.currentUrl}
-              </div>
-            )}
           </div>
         )}
 
@@ -437,38 +425,6 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
         )}
       </div>
 
-      {/* Format Helper Card */}
-      <div className="bg-[#F8FAFC] rounded-lg border border-[#E2E8F0] p-3 text-xs font-mono text-[#475569] space-y-2">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="flex items-start gap-2">
-            <HelpCircle className="w-4 h-4 text-[#0284C7] shrink-0 mt-0.5" />
-            <div>
-              <span className="font-bold text-[#0F172A]">Distance Matrix Upload Guidelines: </span>
-              <span>You can upload your file as a <strong>Pairwise Distances List</strong> (columns: <em>From Location, From Lat, From Lon, To Location, To Lat, To Lon, Distance (km)</em>) or as an <strong>N&times;N Matrix Grid</strong>. Click <strong>Sample Matrix Template</strong> to download a ready-to-use template.</span>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <label className="flex items-center gap-1 text-[11px] text-[#0284C7] hover:underline cursor-pointer font-bold">
-              <Upload className="w-3 h-3" />
-              <span>Upload New Sales Register</span>
-              <input type="file" accept=".xlsx,.xls,.csv" onChange={handleSalesRegisterUpload} className="hidden" />
-            </label>
-          </div>
-        </div>
-
-        {/* Local OSRM Command Reference */}
-        <div className="pt-2 border-t border-[#E2E8F0] flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px]">
-          <div className="flex items-center gap-1.5 text-[#334155]">
-            <Sparkles className="w-3.5 h-3.5 text-[#0284C7]" />
-            <span className="font-bold text-[#0F172A]">Local Terminal Script:</span>
-            <span>Run OSRM generation with custom URL:</span>
-          </div>
-          <code className="bg-[#0F172A] text-[#38BDF8] px-2 py-1 rounded text-[10px] select-all">
-            npx tsx scripts/generate_osrm_matrix.ts &lt;sales_register.xlsx&gt; ./distanceMatrix.xlsx {osrmUrl}
-          </code>
-        </div>
-      </div>
-
       {/* KPI Stats Cards for Distance Matrix */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
@@ -479,7 +435,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
             {cachedMatrix ? cachedMatrix.locations.length : currentLocations.length}
           </div>
           <span className="text-[10px] font-mono text-[#94A3B8] block">
-            {cachedMatrix ? 'Active matrix coordinates' : 'From sales register'}
+            {cachedMatrix ? 'Active matrix destinations' : 'From active orders'}
           </span>
         </div>
 
@@ -492,12 +448,12 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
               ? cachedMatrix.stats.totalPairs
               : currentLocations.length * currentLocations.length}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">Pairwise distance entries</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">Pairwise distance combinations</span>
         </div>
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            OSRM Engine Evaluated
+            Engine Evaluated Pairs
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#0284C7]">
             {cachedMatrix ? (cachedMatrix.stats.osrmTablePairs ?? cachedMatrix.stats.osmTablePairs) : 0}
@@ -507,12 +463,12 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            User Upload / Overrides
+            Custom / Uploaded Pairs
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#7C3AED]">
             {cachedMatrix ? (cachedMatrix.stats.manualPairs ?? 0) : 0}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">Custom File or Manual</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">File Upload or Manual</span>
         </div>
       </div>
 
