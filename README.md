@@ -99,11 +99,11 @@ $$\text{URL Pattern: } \texttt{http://<OSRM\_HOST>:<PORT>/table/v1/driving/lon}_
 
 **Sample Query**:
 ```
-http://192.168.157.174:5001/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0
+http://localhost:5001/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0
 ```
 
 ### Multi-Tier Fallback Structure:
-1. **Tier 1 (Primary)**: Default internal OSRM routing server (`http://192.168.157.174:5001`).
+1. **Tier 1 (Primary)**: Default internal OSRM routing server (`http://localhost:5001`).
 2. **Tier 2 (Fallback)**: Public OpenStreetMap routing service (`https://routing.openstreetmap.de/routed-car`).
 3. **Tier 3 (Fallback)**: Geodesic Haversine formula with a 1.3x road circuity factor to ensure uninterrupted calculations under all network conditions.
 
@@ -183,7 +183,7 @@ npx tsx scripts/generate_osrm_matrix.ts <sales_register.xlsx> [output_matrix.xls
 |---|---|---|
 | `<sales_register.xlsx>` | Path to your input sales register Excel file | *(Required)* |
 | `[output_matrix.xlsx]` | Output destination path for the generated Excel matrix | `./distanceMatrix.xlsx` |
-| `[osrm_base_url]` | OSRM routing server base URL | `http://192.168.157.174:5001` |
+| `[osrm_base_url]` | OSRM routing server base URL | `http://localhost:5001` |
 
 ### Example Usages:
 
@@ -195,7 +195,7 @@ npx tsx scripts/generate_osrm_matrix.ts ./sample_orders.xlsx
 npx tsx scripts/generate_osrm_matrix.ts ./daily_orders.xlsx ./outputs/august_matrix.xlsx http://localhost:5001
 
 # 3. Run against custom network IP:
-npx tsx scripts/generate_osrm_matrix.ts ./sales_register.xlsx ./distanceMatrix.xlsx http://192.168.157.174:5001
+npx tsx scripts/generate_osrm_matrix.ts ./sales_register.xlsx ./distanceMatrix.xlsx http://localhost:5001
 ```
 
 ---
