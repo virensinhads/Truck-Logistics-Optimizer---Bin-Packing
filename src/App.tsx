@@ -17,6 +17,7 @@ export default function App() {
   // Default optimization configuration matching PRD specs
   const [config, setConfig] = useState<OptimizationConfig>({
     enabledVehicleTypes: ['25', '30', '35'],
+    minUtilizationPercent: 80, // 40 to 100%
     slaWindowHours: 2.0, // 1 to 4 hours
     maxMultiDropRadiusKm: 35, // 5 to 100 km
     shiftStartTime: '10:00',
@@ -81,7 +82,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <span className="text-[#38BDF8]">MIN FLEET ALLOCATION</span>
             <span className="text-[#64748B]">•</span>
-            <span className="text-[#4ADE80]">&ge;80.0% UTILIZATION TARGET</span>
+            <span className="text-[#4ADE80]">&ge;{config.minUtilizationPercent ?? 80}.0% UTILIZATION TARGET</span>
           </div>
         </div>
       </footer>

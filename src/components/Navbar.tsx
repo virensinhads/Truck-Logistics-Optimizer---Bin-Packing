@@ -149,12 +149,12 @@ export const Navbar: React.FC<NavbarProps> = ({
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="p-3 rounded-md bg-[#1E293B] border border-[#334155] space-y-1">
-                  <span className="font-bold text-[#F59E0B] uppercase text-[11px]">Payload &gt;80% Min Load Rule</span>
+                  <span className="font-bold text-[#F59E0B] uppercase text-[11px]">Payload &ge;{config.minUtilizationPercent ?? 80}% Min Load Rule</span>
                   <p className="text-[11px] text-[#CBD5E1]">
                     Prefers 1 larger vehicle over multiple smaller ones.<br />
-                    • 25 MT: &ge; 20 MT<br />
-                    • 30 MT: &gt; 25 MT<br />
-                    • 35 MT: &gt; 30 MT
+                    • 25 MT: &ge; {((25 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT<br />
+                    • 30 MT: &ge; {((30 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT<br />
+                    • 35 MT: &ge; {((35 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT
                   </p>
                 </div>
 

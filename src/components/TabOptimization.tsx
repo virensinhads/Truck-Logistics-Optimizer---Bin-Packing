@@ -89,17 +89,22 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
       errors.enabledVehicleTypes = 'Select at least one vehicle type.';
     }
 
-    // 2. SLA Delivery Window: Integer/Decimal between 1 and 4 Hours
+    // 2. Minimum Vehicle Utilization: Integer/Decimal between 40 and 100 %
+    if (isNaN(config.minUtilizationPercent) || config.minUtilizationPercent < 40 || config.minUtilizationPercent > 100) {
+      errors.minUtilizationPercent = 'Min utilization must be between 40% and 100%.';
+    }
+
+    // 3. SLA Delivery Window: Integer/Decimal between 1 and 4 Hours
     if (isNaN(config.slaWindowHours) || config.slaWindowHours < 1 || config.slaWindowHours > 4) {
       errors.slaWindowHours = 'SLA window must be between 1 and 4 hours.';
     }
 
-    // 3. Max Multi-Drop Radius: Between 5 km and 100 km
+    // 4. Max Multi-Drop Radius: Between 5 km and 100 km
     if (isNaN(config.maxMultiDropRadiusKm) || config.maxMultiDropRadiusKm < 5 || config.maxMultiDropRadiusKm > 100) {
       errors.maxMultiDropRadiusKm = 'Multi-drop radius must be between 5 km and 100 km.';
     }
 
-    // 4. Operating Shift Start & End
+    // 5. Operating Shift Start & End
     if (!config.shiftStartTime) {
       errors.shiftStartTime = 'Provide a valid shift start time.';
     }
@@ -243,7 +248,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
               Payload & Route Optimization Engine
             </h1>
             <p className="text-xs text-[#64748B] font-mono mt-0.5">
-              Enforcing <strong className="text-[#0F172A]">&ge; 80.0% load utilization</strong>, <strong className="text-[#0F172A]">Priority I / II / III</strong> grouping hierarchies, and <strong className="text-[#0F172A]">temporal SLA windows</strong>.
+              Enforcing <strong className="text-[#0F172A]">&ge; {config.minUtilizationPercent ?? 80}.0% load utilization</strong>, <strong className="text-[#0F172A]">Priority I / II / III</strong> grouping hierarchies, and <strong className="text-[#0F172A]">temporal SLA windows</strong>.
             </p>
           </div>
 
@@ -315,29 +320,31 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
 
           {/* Form Controls & Validation Panel */}
           <div className="lg:col-span-8 bg-[#F8FAFC] p-3.5 sm:p-4 rounded-lg border border-[#E2E8F0] space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               {/* 1. Fleet Availability */}
               <div className="space-y-1">
                 <label className="text-[11px] font-bold font-mono uppercase tracking-wider text-[#475569] flex items-center justify-between">
                   <span>Fleet Availability</span>
-                  <span className="text-[10px] text-[#94A3B8] font-normal">&ge;80% target</span>
+                  <span className="text-[10px] text-[#94A3B8] font-normal">&ge;{config.minUtilizationPercent ?? 80}%</span>
                 </label>
-                <div className="flex items-center gap-1.5 pt-0.5">
+                <div className="flex items-center gap-1 pt-0.5">
                   {(['25', '30', '35'] as VehicleType[]).map((type) => {
                     const isChecked = config.enabledVehicleTypes.includes(type);
+                    const minMt = ((parseInt(type, 10) * (config.minUtilizationPercent || 80)) / 100).toFixed(1);
                     return (
                       <button
                         key={type}
                         type="button"
                         id={`fleet-toggle-${type}`}
                         onClick={() => handleToggleVehicleType(type)}
-                        className={`flex-1 py-1 px-1.5 rounded-sm text-xs font-mono font-bold border transition ${
+                        title={`Min payload: ${minMt} MT (${config.minUtilizationPercent || 80}% of ${type} MT)`}
+                        className={`flex-1 py-1 px-1 rounded-sm text-[11px] font-mono font-bold border transition ${
                           isChecked
                             ? 'bg-[#0F172A] text-[#38BDF8] border-[#0F172A] shadow-2xs'
                             : 'bg-white text-[#64748B] border-[#CBD5E1] hover:bg-[#F1F5F9]'
                         }`}
                       >
-                        {type} MT
+                        {type}T
                       </button>
                     );
                   })}
@@ -350,7 +357,45 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                 )}
               </div>
 
-              {/* 2. SLA Delivery Window */}
+              {/* 2. Minimum Utilization % */}
+              <div className="space-y-1">
+                <label htmlFor="input-min-utilization" className="text-[11px] font-bold font-mono uppercase tracking-wider text-[#475569] flex items-center justify-between">
+                  <span>Min Utilization</span>
+                  <span className="text-[10px] text-[#94A3B8] font-normal">40–100%</span>
+                </label>
+                <div className="relative">
+                  <input
+                    id="input-min-utilization"
+                    type="number"
+                    min="40"
+                    max="100"
+                    step="1"
+                    value={config.minUtilizationPercent ?? 80}
+                    onChange={(e) =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        minUtilizationPercent: parseFloat(e.target.value) || 0,
+                      }))
+                    }
+                    className={`w-full px-2.5 py-1 rounded-sm border text-xs font-mono bg-white text-[#0F172A] focus:outline-hidden focus:border-[#38BDF8] ${
+                      validationErrors.minUtilizationPercent
+                        ? 'border-[#DC2626] focus:border-[#DC2626]'
+                        : 'border-[#CBD5E1]'
+                    }`}
+                  />
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono font-bold text-[#64748B]">
+                    %
+                  </span>
+                </div>
+                {validationErrors.minUtilizationPercent && (
+                  <p className="text-[10px] text-[#DC2626] font-mono flex items-center gap-1 mt-0.5">
+                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                    <span>{validationErrors.minUtilizationPercent}</span>
+                  </p>
+                )}
+              </div>
+
+              {/* 3. SLA Delivery Window */}
               <div className="space-y-1">
                 <label htmlFor="input-sla-window" className="text-[11px] font-bold font-mono uppercase tracking-wider text-[#475569] flex items-center justify-between">
                   <span>SLA Window</span>
@@ -376,8 +421,8 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                         : 'border-[#CBD5E1]'
                     }`}
                   />
-                  <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-mono text-[#94A3B8]">
-                    Hours
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-[#94A3B8]">
+                    Hrs
                   </span>
                 </div>
                 {validationErrors.slaWindowHours && (
@@ -388,11 +433,11 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                 )}
               </div>
 
-              {/* 3. Max Multi-Drop Radius */}
+              {/* 4. Max Multi-Drop Radius */}
               <div className="space-y-1">
                 <label htmlFor="input-multi-drop-radius" className="text-[11px] font-bold font-mono uppercase tracking-wider text-[#475569] flex items-center justify-between">
-                  <span>Multi-Drop Radius</span>
-                  <span className="text-[10px] text-[#94A3B8] font-normal">5 to 100 km</span>
+                  <span>Radius (D_Max)</span>
+                  <span className="text-[10px] text-[#94A3B8] font-normal">5–100 km</span>
                 </label>
                 <div className="relative">
                   <input
@@ -414,8 +459,8 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                         : 'border-[#CBD5E1]'
                     }`}
                   />
-                  <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-mono text-[#94A3B8]">
-                    km (D_Max)
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-[#94A3B8]">
+                    km
                   </span>
                 </div>
                 {validationErrors.maxMultiDropRadiusKm && (
@@ -552,7 +597,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                   </span>
                 </h2>
                 <p className="text-xs font-mono text-[#64748B] mt-0.5">
-                  Generated at {new Date(optimizationResult.completedAt).toLocaleTimeString()} • Minimizing vehicle count & enforcing &ge;80% payload targets
+                  Generated at {new Date(optimizationResult.completedAt).toLocaleTimeString()} • Minimizing vehicle count & enforcing &ge;{config.minUtilizationPercent ?? 80}.0% payload targets
                 </p>
               </div>
 
@@ -586,7 +631,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                     25 MT Fleet
                   </span>
                   <span className="text-[9px] font-mono px-1 py-0.2 rounded-xs bg-[#F1F5F9] text-[#0F172A] font-bold">
-                    &ge; 20 MT
+                    &ge; {((25 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT
                   </span>
                 </div>
                 <div className="text-2xl font-mono font-extrabold text-[#0F172A]">
@@ -602,7 +647,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                     30 MT Fleet
                   </span>
                   <span className="text-[9px] font-mono px-1 py-0.2 rounded-xs bg-[#F1F5F9] text-[#0F172A] font-bold">
-                    &gt; 25 MT
+                    &ge; {((30 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT
                   </span>
                 </div>
                 <div className="text-2xl font-mono font-extrabold text-[#0F172A]">
@@ -618,7 +663,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                     35 MT Fleet
                   </span>
                   <span className="text-[9px] font-mono px-1 py-0.2 rounded-xs bg-[#F1F5F9] text-[#0F172A] font-bold">
-                    &gt; 30 MT
+                    &ge; {((35 * (config.minUtilizationPercent || 80)) / 100).toFixed(1)} MT
                   </span>
                 </div>
                 <div className="text-2xl font-mono font-extrabold text-[#0F172A]">
@@ -646,7 +691,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
                 <div className="text-2xl font-mono font-extrabold text-[#059669]">
                   {optimizationResult.summary.averageUtilizationPercent}%
                 </div>
-                <span className="text-[10px] font-mono text-[#94A3B8] block">Target: &ge;80.0%</span>
+                <span className="text-[10px] font-mono text-[#94A3B8] block">Target: &ge;{(config.minUtilizationPercent ?? 80).toFixed(1)}%</span>
               </div>
 
               {/* Dispatched Weight vs Backlog */}

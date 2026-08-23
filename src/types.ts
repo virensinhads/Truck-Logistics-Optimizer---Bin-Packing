@@ -32,6 +32,7 @@ export interface OrderLineItem {
 
 export interface OptimizationConfig {
   enabledVehicleTypes: VehicleType[];
+  minUtilizationPercent: number; // 40 to 100%, default 80
   slaWindowHours: number; // 1 to 4 Hours
   maxMultiDropRadiusKm: number; // 5 to 100 km
   shiftStartTime: string; // e.g. "10:00"
@@ -40,6 +41,7 @@ export interface OptimizationConfig {
 
 export interface ConfigValidationErrors {
   enabledVehicleTypes?: string;
+  minUtilizationPercent?: string;
   slaWindowHours?: string;
   maxMultiDropRadiusKm?: string;
   shiftStartTime?: string;

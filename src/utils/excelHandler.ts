@@ -393,8 +393,8 @@ export async function parseSalesRegisterFile(file: File): Promise<OrderLineItem[
     }
 
     // Map SO/PO Date
-    const rawDate = findColumnValue(row, ['SO/PO Date', 'SO Date', 'PO Date', 'Date', 'Order Date']) || '01/10/2026';
-    const rawTime = findColumnValue(row, ['SO/STO creation time', 'SO creation time', 'Creation Time', 'Time', 'Order Time']) || '10:00:00';
+    const rawDate = findColumnValue(row, ['SO/PO Date', 'SO Date', 'PO Date', 'Date', 'Order Date', 'SO/PO Date_1']) || '01/10/2026';
+    const rawTime = findColumnValue(row, ['SO/STO creation time', 'SO/STO creat', 'SO/STO Creation', 'SO creation time', 'Creation Time', 'Time', 'Order Time']) || '10:00:00';
 
     // Map Parties & Dest
     const soldToParty = String(findColumnValue(row, ['Sold to Party (dealer)', 'Sold to Party', 'Dealer', 'Dealer ID', 'Sold-to']) || `Dealer-${index + 1}`).trim();

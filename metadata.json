@@ -1,5 +1,5 @@
 {
-  "name": "Logistics Payload & Route Optimization Engine",
+  "name": "Payload and Route Optimizer",
   "description": "Two-phase logistics payload and route optimization engine for sales register Excel files with OSM distance matrix calculation, multi-drop bin packing, SLA tracking, and export.",
   "requestFramePermissions": [],
   "majorCapabilities": [
