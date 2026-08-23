@@ -2,8 +2,12 @@ import { DistanceMatrixData, LocationPoint, DistanceMatrixEntry } from '../types
 import { computeHaversineDistanceKm, estimateDrivingDurationMin } from './haversine';
 import * as XLSX from 'xlsx';
 
-// Local storage key for persisting distance matrix across tabs/sessions
+export const DEFAULT_OSRM_URL = 'http://192.168.157.174:5001';
+export const FALLBACK_PUBLIC_OSM_URL = 'https://routing.openstreetmap.de/routed-car';
+
+// Local storage keys for persisting distance matrix and custom OSRM endpoint
 export const DISTANCE_MATRIX_STORAGE_KEY = 'LOGISTICS_DISTANCE_MATRIX_CACHE';
+export const OSRM_URL_STORAGE_KEY = 'LOGISTICS_OSRM_BASE_URL';
 
 /**
  * Generates a unique key for a coordinate pair
@@ -40,63 +44,43 @@ export function extractUniqueLocations(
   return Array.from(map.values());
 }
 
-/**
- * Helper to call OSM Table API for a batch of locations
- */
-async function fetchOsmTableApiBatch(
-  locations: LocationPoint[],
-  timeoutMs = 4000
-): Promise<{
-  distances?: (number | null)[][];
-  durations?: (number | null)[][];
-  success: boolean;
-}> {
-  try {
-    const coordsParam = locations.map((loc) => `${loc.lon},${loc.lat}`).join(';');
-    const url = `https://routing.openstreetmap.de/routed-car/table/v1/driving/${coordsParam}?annotations=distance,duration`;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
-    });
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      return { success: false };
-    }
-
-    const data = await res.json();
-    if (data.code === 'Ok' && Array.isArray(data.distances)) {
-      return {
-        distances: data.distances,
-        durations: data.durations,
-        success: true,
-      };
-    }
-    return { success: false };
-  } catch (err) {
-    return { success: false };
-  }
+export interface OsrmSourceQueryResult {
+  distances: number[];
+  durations: number[];
+  isSuccess: boolean;
+  tier: 'osrm-table' | 'osm-table' | 'haversine';
+  queriedUrl: string;
+  errorMessage?: string;
 }
 
 /**
- * Helper to call OSM Route API for a single coordinate pair
+ * Queries OSRM /table/v1/driving/ endpoint for a specific source index (sources={i})
+ * Format: {osrmBaseUrl}/table/v1/driving/{lon1},{lat1};{lon2},{lat2};...?annotations=distance,duration&sources={sourceIndex}
+ * Following the exact methodology of scripts/generate_osrm_matrix.ts
  */
-async function fetchOsmRouteApiPair(
-  loc1: LocationPoint,
-  loc2: LocationPoint,
-  timeoutMs = 2500
-): Promise<{
-  distanceKm?: number;
-  durationMin?: number;
-  success: boolean;
-}> {
-  try {
-    const url = `https://routing.openstreetmap.de/routed-car/route/v1/driving/${loc1.lon},${loc1.lat};${loc2.lon},${loc2.lat}?overview=false`;
+export async function queryOsrmTableForSource(
+  osrmBaseUrl: string,
+  locations: LocationPoint[],
+  sourceIndex: number,
+  timeoutMs = 8000
+): Promise<OsrmSourceQueryResult> {
+  const coordsParam = locations.map((loc) => `${loc.lon},${loc.lat}`).join(';');
+  const cleanBase = (osrmBaseUrl || DEFAULT_OSRM_URL).replace(/\/+$/, '');
+  const url = `${cleanBase}/table/v1/driving/${coordsParam}?annotations=distance,duration&sources=${sourceIndex}`;
 
+  const origin = locations[sourceIndex];
+
+  // Helper for single row fallback
+  const getFallbackRow = (tier: 'osm-table' | 'haversine' = 'haversine') => {
+    const distances = locations.map((dest) => {
+      if (origin.key === dest.key) return 0;
+      return Math.round(computeHaversineDistanceKm(origin.lat, origin.lon, dest.lat, dest.lon, true) * 100) / 100;
+    });
+    const durations = distances.map((d) => estimateDrivingDurationMin(d));
+    return { distances, durations, isSuccess: false, tier, queriedUrl: url };
+  };
+
+  try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -107,23 +91,86 @@ async function fetchOsmRouteApiPair(
     clearTimeout(timer);
 
     if (!res.ok) {
-      return { success: false };
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
     }
 
-    const data = await res.json();
-    if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
-      const route = data.routes[0];
-      const distKm = Math.round((route.distance / 1000) * 100) / 100;
-      const durMin = Math.round((route.duration / 60) * 10) / 10;
+    const data: any = await res.json();
+    if (data.code === 'Ok' && Array.isArray(data.distances) && data.distances[0]) {
+      const rowMeters: (number | null)[] = data.distances[0];
+      const rowSeconds: (number | null)[] = data.durations && data.durations[0] ? data.durations[0] : [];
+
+      const distancesKm = rowMeters.map((m, idx) => {
+        if (m === null || m === undefined || isNaN(m) || m < 0) {
+          const dest = locations[idx];
+          if (origin.key === dest.key) return 0;
+          return Math.round(computeHaversineDistanceKm(origin.lat, origin.lon, dest.lat, dest.lon, true) * 100) / 100;
+        }
+        return Math.round((m / 1000) * 100) / 100;
+      });
+
+      const durationsMin = rowSeconds.map((s, idx) => {
+        if (s === null || s === undefined || isNaN(s) || s < 0) {
+          return estimateDrivingDurationMin(distancesKm[idx]);
+        }
+        return Math.round((s / 60) * 10) / 10;
+      });
+
+      const isCustomOsrm = !cleanBase.includes('openstreetmap.de');
       return {
-        distanceKm: distKm,
-        durationMin: durMin,
-        success: true,
+        distances: distancesKm,
+        durations: durationsMin,
+        isSuccess: true,
+        tier: isCustomOsrm ? 'osrm-table' : 'osm-table',
+        queriedUrl: url,
       };
+    } else {
+      throw new Error(`OSRM response code: ${data.code || 'Unknown'}`);
     }
-    return { success: false };
-  } catch (err) {
-    return { success: false };
+  } catch (err: any) {
+    // If custom OSRM fails (e.g. CORS/mixed-content from browser), try public OSM endpoint as bridge fallback
+    if (!cleanBase.includes('openstreetmap.de')) {
+      try {
+        const publicUrl = `${FALLBACK_PUBLIC_OSM_URL}/table/v1/driving/${coordsParam}?annotations=distance,duration&sources=${sourceIndex}`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        const pubRes = await fetch(publicUrl, { signal: controller.signal, headers: { Accept: 'application/json' } });
+        clearTimeout(timer);
+
+        if (pubRes.ok) {
+          const pubData = await pubRes.json();
+          if (pubData.code === 'Ok' && Array.isArray(pubData.distances) && pubData.distances[0]) {
+            const rowM = pubData.distances[0];
+            const rowS = pubData.durations?.[0] || [];
+            const distancesKm = rowM.map((m: any, idx: number) => {
+              if (m == null || isNaN(m)) {
+                const dest = locations[idx];
+                return Math.round(computeHaversineDistanceKm(origin.lat, origin.lon, dest.lat, dest.lon, true) * 100) / 100;
+              }
+              return Math.round((m / 1000) * 100) / 100;
+            });
+            const durationsMin = rowS.map((s: any, idx: number) => {
+              if (s == null || isNaN(s)) return estimateDrivingDurationMin(distancesKm[idx]);
+              return Math.round((s / 60) * 10) / 10;
+            });
+            return {
+              distances: distancesKm,
+              durations: durationsMin,
+              isSuccess: true,
+              tier: 'osm-table',
+              queriedUrl: publicUrl,
+            };
+          }
+        }
+      } catch (pubErr) {
+        // Fall through to Haversine
+      }
+    }
+
+    // Infallible 1.3x Haversine fallback
+    return {
+      ...getFallbackRow('haversine'),
+      errorMessage: err?.message || 'Connection failed',
+    };
   }
 }
 
@@ -132,27 +179,48 @@ export type MatrixProgressCallback = (progress: {
   step: string;
   processedPairs: number;
   totalPairs: number;
-  tierCounts: { osmTable: number; osmRoute: number; haversine: number };
+  currentSourceIndex: number;
+  totalSources: number;
+  currentSourceLocation?: LocationPoint;
+  currentUrl?: string;
+  tierCounts: { osrmTable: number; osmTable: number; osmRoute: number; haversine: number };
 }) => void;
 
+export interface GenerateDistanceMatrixOptions {
+  osrmBaseUrl?: string;
+  onProgress?: MatrixProgressCallback;
+}
+
 /**
- * Script 1: 3-Tier Distance Matrix Engine
- * 1. Primary: OSM Table API (batch chunks)
- * 2. Secondary: OSM Route API (individual retry)
- * 3. Tertiary: 1.3x Haversine Formula (instant & infallible fallback)
+ * Script 1: OSRM Distance Matrix Engine (Matching scripts/generate_osrm_matrix.ts)
+ * 
+ * Iterates through all unique locations rotating source index `sources=0` to `sources=N-1`:
+ * URL Pattern:
+ * {osrmBaseUrl}/table/v1/driving/{lon1},{lat1};{lon2},{lat2};...;{lonN},{latN}?annotations=distance,duration&sources={i}
+ * 
+ * Sample URL:
+ * http://192.168.157.174:5001/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0
  */
 export async function generateDistanceMatrix(
   locations: LocationPoint[],
-  onProgress?: MatrixProgressCallback
+  optionsOrProgress?: GenerateDistanceMatrixOptions | MatrixProgressCallback
 ): Promise<DistanceMatrixData> {
+  const options: GenerateDistanceMatrixOptions =
+    typeof optionsOrProgress === 'function'
+      ? { onProgress: optionsOrProgress }
+      : optionsOrProgress || {};
+
+  const osrmBaseUrl = options.osrmBaseUrl || loadOsrmBaseUrlFromStorage() || DEFAULT_OSRM_URL;
+  const onProgress = options.onProgress;
+
   const n = locations.length;
   const totalPairs = n * n;
 
   const matrix: Record<string, Record<string, number>> = {};
   const durations: Record<string, Record<string, number>> = {};
-  const sources: Record<string, Record<string, 'osm-table' | 'osm-route' | 'haversine' | 'manual'>> = {};
+  const sources: Record<string, Record<string, 'osrm-table' | 'osm-table' | 'osm-route' | 'haversine' | 'manual'>> = {};
 
-  // Initialize objects
+  // Initialize data structures
   for (const loc1 of locations) {
     matrix[loc1.key] = {};
     durations[loc1.key] = {};
@@ -161,17 +229,18 @@ export async function generateDistanceMatrix(
       if (loc1.key === loc2.key) {
         matrix[loc1.key][loc2.key] = 0;
         durations[loc1.key][loc2.key] = 0;
-        sources[loc1.key][loc2.key] = 'osm-table';
+        sources[loc1.key][loc2.key] = 'osrm-table';
       }
     }
   }
 
-  let processedPairs = 0;
+  let osrmTablePairs = 0;
   let osmTablePairs = 0;
   let osmRoutePairs = 0;
   let haversinePairs = 0;
+  let processedPairs = 0;
 
-  // Handle trivial case (empty or 1 location)
+  // Handle empty or single location
   if (n <= 1) {
     const result: DistanceMatrixData = {
       locations,
@@ -181,7 +250,8 @@ export async function generateDistanceMatrix(
       generatedAt: new Date().toISOString(),
       stats: {
         totalPairs,
-        osmTablePairs: n,
+        osrmTablePairs: n,
+        osmTablePairs: 0,
         osmRoutePairs: 0,
         haversinePairs: 0,
         manualPairs: 0,
@@ -192,120 +262,71 @@ export async function generateDistanceMatrix(
   }
 
   onProgress?.({
-    percent: 10,
-    step: `Processing ${locations.length} unique coordinates (${totalPairs} total pairs)...`,
+    percent: 5,
+    step: `Initializing OSRM Matrix Engine for ${n} locations (${totalPairs} road pairs)...`,
     processedPairs: 0,
     totalPairs,
-    tierCounts: { osmTable: 0, osmRoute: 0, haversine: 0 },
+    currentSourceIndex: 0,
+    totalSources: n,
+    currentSourceLocation: locations[0],
+    currentUrl: `${osrmBaseUrl}/table/v1/driving/...&sources=0`,
+    tierCounts: { osrmTable: 0, osmTable: 0, osmRoute: 0, haversine: 0 },
   });
 
-  // TIER 1: Try OSM Table API in batch or sub-batches (max batch size = 25 for safe URL length)
-  const CHUNK_SIZE = 20;
-  const isSmallEnoughForSingleTable = n <= CHUNK_SIZE;
-
-  if (isSmallEnoughForSingleTable) {
-    onProgress?.({
-      percent: 25,
-      step: 'Tier 1: Querying OpenStreetMap Table API for all coordinate pairs...',
-      processedPairs: 0,
-      totalPairs,
-      tierCounts: { osmTable: 0, osmRoute: 0, haversine: 0 },
-    });
-
-    const tableResult = await fetchOsmTableApiBatch(locations);
-
-    if (tableResult.success && tableResult.distances) {
-      for (let i = 0; i < n; i++) {
-        for (let j = 0; j < n; j++) {
-          const loc1 = locations[i];
-          const loc2 = locations[j];
-          const distMeters = tableResult.distances[i]?.[j];
-          const durSeconds = tableResult.durations?.[i]?.[j];
-
-          if (distMeters != null && distMeters >= 0) {
-            const distKm = Math.round((distMeters / 1000) * 100) / 100;
-            const durMin = durSeconds != null ? Math.round((durSeconds / 60) * 10) / 10 : estimateDrivingDurationMin(distKm);
-            matrix[loc1.key][loc2.key] = distKm;
-            durations[loc1.key][loc2.key] = durMin;
-            sources[loc1.key][loc2.key] = 'osm-table';
-            osmTablePairs++;
-            processedPairs++;
-          }
-        }
-      }
-    }
-  }
-
-  // TIER 2 & TIER 3: Fill any remaining or missing pairs
-  const missingPairs: Array<{ i: number; j: number; loc1: LocationPoint; loc2: LocationPoint }> = [];
-
+  // Evaluate each of the sources N times (sources=0 to sources=N-1)
   for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      const loc1 = locations[i];
-      const loc2 = locations[j];
+    const origin = locations[i];
+    const currentPercent = Math.round(((i) / n) * 90) + 5;
 
-      if (loc1.key === loc2.key) {
-        if (!matrix[loc1.key][loc2.key]) {
-          matrix[loc1.key][loc2.key] = 0;
-          durations[loc1.key][loc2.key] = 0;
-          sources[loc1.key][loc2.key] = 'osm-table';
-          processedPairs++;
-        }
-        continue;
-      }
-
-      if (matrix[loc1.key][loc2.key] === undefined) {
-        missingPairs.push({ i, j, loc1, loc2 });
-      }
-    }
-  }
-
-  if (missingPairs.length > 0) {
     onProgress?.({
-      percent: 50,
-      step: `Tier 2 & 3: Resolving ${missingPairs.length} pending pairs via OSM Route API & Haversine...`,
+      percent: currentPercent,
+      step: `Evaluating source ${i + 1}/${n}: ${origin.name} (${origin.lon}, ${origin.lat})...`,
       processedPairs,
       totalPairs,
-      tierCounts: { osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
+      currentSourceIndex: i,
+      totalSources: n,
+      currentSourceLocation: origin,
+      currentUrl: `${osrmBaseUrl}/table/v1/driving/...&sources=${i}`,
+      tierCounts: { osrmTable: osrmTablePairs, osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
     });
 
-    // Try Route API with max concurrency of 3 to respect rate limits
-    const BATCH_SIZE = 5;
-    for (let k = 0; k < missingPairs.length; k += BATCH_SIZE) {
-      const slice = missingPairs.slice(k, k + BATCH_SIZE);
+    const result = await queryOsrmTableForSource(osrmBaseUrl, locations, i);
 
-      await Promise.all(
-        slice.map(async ({ loc1, loc2 }) => {
-          // Tier 2: Route API
-          const routeRes = await fetchOsmRouteApiPair(loc1, loc2);
+    for (let j = 0; j < n; j++) {
+      const dest = locations[j];
+      const dist = origin.key === dest.key ? 0 : result.distances[j];
+      const dur = origin.key === dest.key ? 0 : result.durations[j];
 
-          if (routeRes.success && routeRes.distanceKm !== undefined) {
-            matrix[loc1.key][loc2.key] = routeRes.distanceKm;
-            durations[loc1.key][loc2.key] = routeRes.durationMin ?? estimateDrivingDurationMin(routeRes.distanceKm);
-            sources[loc1.key][loc2.key] = 'osm-route';
-            osmRoutePairs++;
-          } else {
-            // Tier 3: 1.3x Road Circuity Haversine Fallback
-            const havDistKm = computeHaversineDistanceKm(loc1.lat, loc1.lon, loc2.lat, loc2.lon, true);
-            const havDurMin = estimateDrivingDurationMin(havDistKm);
-            matrix[loc1.key][loc2.key] = havDistKm;
-            durations[loc1.key][loc2.key] = havDurMin;
-            sources[loc1.key][loc2.key] = 'haversine';
-            haversinePairs++;
-          }
-          processedPairs++;
-        })
-      );
+      matrix[origin.key][dest.key] = dist;
+      durations[origin.key][dest.key] = dur;
 
-      const currentPercent = Math.min(95, Math.round(50 + (k / missingPairs.length) * 45));
-      onProgress?.({
-        percent: currentPercent,
-        step: `Resolving pairs (${processedPairs}/${totalPairs})...`,
-        processedPairs,
-        totalPairs,
-        tierCounts: { osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
-      });
+      if (origin.key === dest.key) {
+        sources[origin.key][dest.key] = result.tier;
+      } else {
+        sources[origin.key][dest.key] = result.tier;
+      }
+
+      if (result.tier === 'osrm-table') {
+        osrmTablePairs++;
+      } else if (result.tier === 'osm-table') {
+        osmTablePairs++;
+      } else {
+        haversinePairs++;
+      }
+      processedPairs++;
     }
+
+    onProgress?.({
+      percent: Math.round(((i + 1) / n) * 95),
+      step: `Processed source ${i + 1}/${n} [${result.tier.toUpperCase()}] (${processedPairs}/${totalPairs} pairs completed)`,
+      processedPairs,
+      totalPairs,
+      currentSourceIndex: i + 1,
+      totalSources: n,
+      currentSourceLocation: origin,
+      currentUrl: result.queriedUrl,
+      tierCounts: { osrmTable: osrmTablePairs, osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
+    });
   }
 
   const result: DistanceMatrixData = {
@@ -316,6 +337,7 @@ export async function generateDistanceMatrix(
     generatedAt: new Date().toISOString(),
     stats: {
       totalPairs,
+      osrmTablePairs,
       osmTablePairs,
       osmRoutePairs,
       haversinePairs,
@@ -327,13 +349,37 @@ export async function generateDistanceMatrix(
 
   onProgress?.({
     percent: 100,
-    step: `Distance Matrix generated successfully (${totalPairs} pairs)`,
+    step: `Distance Matrix generated successfully for ${n} locations (${totalPairs} pairs)`,
     processedPairs: totalPairs,
     totalPairs,
-    tierCounts: { osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
+    currentSourceIndex: n,
+    totalSources: n,
+    tierCounts: { osrmTable: osrmTablePairs, osmTable: osmTablePairs, osmRoute: osmRoutePairs, haversine: haversinePairs },
   });
 
   return result;
+}
+
+/**
+ * Saves OSRM base URL to local storage
+ */
+export function saveOsrmBaseUrlToStorage(url: string): void {
+  try {
+    localStorage.setItem(OSRM_URL_STORAGE_KEY, url);
+  } catch (err) {
+    console.warn('Could not persist OSRM base URL:', err);
+  }
+}
+
+/**
+ * Loads OSRM base URL from local storage
+ */
+export function loadOsrmBaseUrlFromStorage(): string | null {
+  try {
+    return localStorage.getItem(OSRM_URL_STORAGE_KEY);
+  } catch (err) {
+    return null;
+  }
 }
 
 /**
@@ -423,7 +469,16 @@ export function exportDistanceMatrixToExcel(data: DistanceMatrixData, filename =
         'To Lon': dest.lon,
         'Distance (km)': dist,
         'Est. Duration (min)': dur,
-        'Calculation Tier': src === 'osm-table' ? 'Tier 1 (OSM Table API)' : src === 'osm-route' ? 'Tier 2 (OSM Route API)' : src === 'manual' ? 'Manual Override' : 'Tier 3 (1.3x Haversine Fallback)',
+        'Calculation Tier':
+          src === 'osrm-table'
+            ? 'Tier 1 (OSRM Table Engine)'
+            : src === 'osm-table'
+            ? 'Tier 1 (Public OSM Table API)'
+            : src === 'osm-route'
+            ? 'Tier 2 (OSM Route API)'
+            : src === 'manual'
+            ? 'Manual Override / Upload'
+            : 'Tier 3 (1.3x Haversine Fallback)',
       });
     }
   }
@@ -436,9 +491,11 @@ export function exportDistanceMatrixToExcel(data: DistanceMatrixData, filename =
     { Property: 'Generated At', Value: data.generatedAt },
     { Property: 'Total Unique Locations', Value: data.locations.length },
     { Property: 'Total Distance Pairs Evaluated', Value: data.stats.totalPairs },
-    { Property: 'Tier 1 (OSM Table API) Pairs', Value: data.stats.osmTablePairs },
-    { Property: 'Tier 2 (OSM Route API) Pairs', Value: data.stats.osmRoutePairs },
-    { Property: 'Tier 3 (1.3x Haversine Fallback) Pairs', Value: data.stats.haversinePairs },
+    { Property: 'OSRM Table Engine Pairs', Value: data.stats.osrmTablePairs ?? 0 },
+    { Property: 'Public OSM Table Pairs', Value: data.stats.osmTablePairs },
+    { Property: 'OSM Route API Pairs', Value: data.stats.osmRoutePairs },
+    { Property: '1.3x Haversine Fallback Pairs', Value: data.stats.haversinePairs },
+    { Property: 'User Manual / Uploaded Pairs', Value: data.stats.manualPairs ?? 0 },
     { Property: 'Road Circuity Factor', Value: '1.3x' },
   ];
   const wsMeta = XLSX.utils.json_to_sheet(metaData);

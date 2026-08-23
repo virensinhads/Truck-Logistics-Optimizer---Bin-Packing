@@ -13,7 +13,9 @@ import {
   Check,
   FileUp,
   HelpCircle,
-  Download
+  Download,
+  Server,
+  Terminal,
 } from 'lucide-react';
 import { DistanceMatrixData, LocationPoint, OrderLineItem } from '../types';
 import {
@@ -22,13 +24,17 @@ import {
   exportDistanceMatrixToExcel,
   exportDistanceMatrixToJson,
   saveDistanceMatrixToStorage,
-  getLocationKey
+  saveOsrmBaseUrlToStorage,
+  loadOsrmBaseUrlFromStorage,
+  DEFAULT_OSRM_URL,
+  FALLBACK_PUBLIC_OSM_URL,
+  getLocationKey,
 } from '../utils/distanceMatrixEngine';
 import { SAMPLE_SALES_REGISTER_ORDERS } from '../utils/sampleData';
 import {
   parseSalesRegisterFile,
   parseDistanceMatrixExcel,
-  downloadSampleDistanceMatrixTemplate
+  downloadSampleDistanceMatrixTemplate,
 } from '../utils/excelHandler';
 
 interface TabDistanceMatrixProps {
@@ -46,18 +52,25 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 }) => {
   const [isRunning, setIsRunning] = useState(false);
   const [isUploadingMatrix, setIsUploadingMatrix] = useState(false);
+  const [osrmUrl, setOsrmUrl] = useState<string>(() => loadOsrmBaseUrlFromStorage() || DEFAULT_OSRM_URL);
   const [progress, setProgress] = useState<{
     percent: number;
     step: string;
     processedPairs: number;
     totalPairs: number;
-    tierCounts: { osmTable: number; osmRoute: number; haversine: number };
+    currentSourceIndex: number;
+    totalSources: number;
+    currentSourceLocation?: LocationPoint;
+    currentUrl?: string;
+    tierCounts: { osrmTable: number; osmTable: number; osmRoute: number; haversine: number };
   }>({
     percent: 0,
     step: 'Idle',
     processedPairs: 0,
     totalPairs: 0,
-    tierCounts: { osmTable: 0, osmRoute: 0, haversine: 0 },
+    currentSourceIndex: 0,
+    totalSources: 0,
+    tierCounts: { osrmTable: 0, osmTable: 0, osmRoute: 0, haversine: 0 },
   });
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -75,7 +88,24 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     return extractUniqueLocations(SAMPLE_SALES_REGISTER_ORDERS);
   }, [activeOrders]);
 
-  // Execute Script 1 (Live API evaluation)
+  // Generate sample URL for UI reference matching user's exact specification
+  const sampleUrlPreview = useMemo(() => {
+    const cleanBase = (osrmUrl || DEFAULT_OSRM_URL).replace(/\/+$/, '');
+    if (currentLocations.length >= 2) {
+      const loc1 = currentLocations[0];
+      const loc2 = currentLocations[1];
+      return `${cleanBase}/table/v1/driving/${loc1.lon},${loc1.lat};${loc2.lon},${loc2.lat}?annotations=distance,duration&sources=0`;
+    }
+    return `${cleanBase}/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0`;
+  }, [osrmUrl, currentLocations]);
+
+  // Handle URL change & persist
+  const handleOsrmUrlChange = (newUrl: string) => {
+    setOsrmUrl(newUrl);
+    saveOsrmBaseUrlToStorage(newUrl);
+  };
+
+  // Execute Script 1 (Live OSRM Table evaluation with sources=0..N-1 rotation)
   const handleRunScript1 = async () => {
     if (currentLocations.length === 0) {
       setStatusMessage({ text: 'No valid coordinates found to compute matrix.', type: 'error' });
@@ -86,13 +116,21 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     setStatusMessage(null);
 
     try {
-      const matrixData = await generateDistanceMatrix(currentLocations, (p) => {
-        setProgress(p);
+      const matrixData = await generateDistanceMatrix(currentLocations, {
+        osrmBaseUrl: osrmUrl,
+        onProgress: (p) => {
+          setProgress(p);
+        },
       });
       setCachedMatrix(matrixData);
       saveDistanceMatrixToStorage(matrixData);
+
+      const osrmCount = matrixData.stats.osrmTablePairs ?? 0;
+      const osmCount = matrixData.stats.osmTablePairs;
+      const havCount = matrixData.stats.haversinePairs;
+
       setStatusMessage({
-        text: `Success! Distance matrix evaluated via Script 1 for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs) and saved as distanceMatrix.`,
+        text: `Success! Distance matrix evaluated for ${matrixData.locations.length} locations (${matrixData.stats.totalPairs} pairs across ${matrixData.locations.length} source requests). [OSRM Server: ${osrmCount} pairs, Public OSM: ${osmCount} pairs, Haversine Fallback: ${havCount} pairs]. Saved as active matrix!`,
         type: 'success',
       });
     } catch (err: any) {
@@ -202,13 +240,13 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
           <div className="space-y-1.5 max-w-3xl">
             <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-xs bg-[#0F172A] text-[#38BDF8] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#334155]">
               <Sparkles className="w-3 h-3 text-[#38BDF8]" />
-              <span>Script 1: Distance Matrix Engine</span>
+              <span>Script 1: OSRM Distance Matrix Engine</span>
             </div>
             <h1 className="text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
               Distance Matrix Management &amp; Evaluation
             </h1>
             <p className="text-xs text-[#64748B] font-mono leading-relaxed">
-              Provides the pairwise road distances (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">km</code>) required by the multi-drop clustering algorithm. You can either <strong className="text-[#0F172A]">evaluate live via Script 1 API</strong> or <strong className="text-[#0F172A]">upload your custom Distance Matrix Excel file</strong> directly.
+              Calculates the full <strong className="text-[#0F172A]">N&times;N road distance matrix</strong> by evaluating distance for each of the <strong className="text-[#0F172A]">N sources</strong> (<code className="text-[11px] bg-[#F1F5F9] px-1 py-0.2 rounded text-[#0F172A]">sources=0..N-1</code>) via OSRM table endpoints. You can run against your local/network OSRM server, public OSM router, or upload a custom Excel matrix file.
             </p>
           </div>
 
@@ -255,17 +293,92 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                   ? 'bg-[#94A3B8] text-white cursor-not-allowed opacity-75'
                   : 'bg-[#0F172A] hover:bg-[#1E293B] text-[#38BDF8] border border-[#334155]'
               }`}
-              title="Compute distance matrix automatically using OSM API & Haversine fallback"
+              title="Compute distance matrix rotating sources=0..N-1 using OSRM Table API"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin text-[#38BDF8]' : ''}`} />
-              <span>{isRunning ? 'Computing...' : 'Evaluate via API (Script 1)'}</span>
+              <span>{isRunning ? 'Evaluating...' : 'Evaluate via OSRM (Script 1)'}</span>
             </button>
+          </div>
+        </div>
+
+        {/* OSRM Server Endpoint Configuration & Live URL Preview */}
+        <div className="mt-4 pt-3 border-t border-[#E2E8F0] space-y-2.5 font-mono">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-2.5 bg-[#F8FAFC] p-3 rounded-md border border-[#E2E8F0]">
+            <div className="flex items-center gap-2 text-xs font-bold text-[#0F172A] shrink-0">
+              <Server className="w-4 h-4 text-[#0284C7]" />
+              <span>OSRM Server URL:</span>
+            </div>
+
+            <div className="flex flex-1 items-center gap-2">
+              <input
+                id="input-osrm-url"
+                type="text"
+                value={osrmUrl}
+                onChange={(e) => handleOsrmUrlChange(e.target.value)}
+                placeholder="http://192.168.157.174:5001"
+                className="flex-1 px-2.5 py-1 text-xs font-mono rounded-sm border border-[#CBD5E1] bg-white text-[#0F172A] focus:outline-hidden focus:border-[#38BDF8]"
+              />
+
+              {/* Quick Preset Buttons */}
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleOsrmUrlChange('http://192.168.157.174:5001')}
+                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
+                    osrmUrl === 'http://192.168.157.174:5001'
+                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
+                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
+                  }`}
+                  title="Use 192.168.157.174:5001"
+                >
+                  192.168.157.174
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOsrmUrlChange('http://localhost:5001')}
+                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
+                    osrmUrl === 'http://localhost:5001'
+                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
+                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
+                  }`}
+                  title="Use localhost:5001"
+                >
+                  localhost
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOsrmUrlChange(FALLBACK_PUBLIC_OSM_URL)}
+                  className={`px-2 py-1 text-[10px] font-bold rounded-xs cursor-pointer border ${
+                    osrmUrl === FALLBACK_PUBLIC_OSM_URL
+                      ? 'bg-[#0284C7] text-white border-[#0284C7]'
+                      : 'bg-white text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
+                  }`}
+                  title="Use Public OpenStreetMap routing server"
+                >
+                  Public OSM
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Sample Table Request Pattern Display */}
+          <div className="bg-[#0F172A] text-[#94A3B8] p-2.5 rounded-md text-[11px] overflow-x-auto space-y-1">
+            <div className="flex items-center justify-between text-[#38BDF8] text-[10px] font-bold uppercase tracking-wider">
+              <span className="flex items-center gap-1">
+                <Terminal className="w-3 h-3" />
+                <span>Sample OSRM Query Pattern (Evaluates N Sources: sources=0..{Math.max(0, currentLocations.length - 1)})</span>
+              </span>
+              <span className="text-[#64748B]">GET /table/v1/driving</span>
+            </div>
+            <code className="text-[#38BDF8] text-[10px] block break-all select-all font-mono">
+              {sampleUrlPreview}
+            </code>
           </div>
         </div>
 
         {/* Progress Bar during API Execution */}
         {isRunning && (
-          <div className="mt-4 pt-3 border-t border-[#E2E8F0] space-y-1.5 font-mono">
+          <div className="mt-4 pt-3 border-t border-[#E2E8F0] space-y-2 font-mono">
             <div className="flex items-center justify-between text-xs font-bold text-[#0F172A]">
               <span className="flex items-center gap-1.5 text-[#0284C7]">
                 <span className="w-2 h-2 rounded-full bg-[#0284C7] animate-ping" />
@@ -279,11 +392,17 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                 style={{ width: `${progress.percent}%` }}
               />
             </div>
-            <div className="flex items-center justify-between text-[10px] text-[#64748B] pt-0.5">
-              <span>Tier 1 (OSM Table): {progress.tierCounts.osmTable}</span>
-              <span>Tier 2 (OSM Route): {progress.tierCounts.osmRoute}</span>
-              <span>Tier 3 (Haversine 1.3x): {progress.tierCounts.haversine}</span>
+            <div className="flex flex-wrap items-center justify-between text-[10px] text-[#64748B] pt-0.5">
+              <span>Source Query: {progress.currentSourceIndex}/{progress.totalSources}</span>
+              <span>OSRM Table Pairs: {progress.tierCounts.osrmTable}</span>
+              <span>Public OSM: {progress.tierCounts.osmTable}</span>
+              <span>Haversine 1.3x Fallback: {progress.tierCounts.haversine}</span>
             </div>
+            {progress.currentUrl && (
+              <div className="text-[9px] text-[#64748B] truncate bg-[#F8FAFC] p-1.5 rounded border border-[#E2E8F0]">
+                <strong className="text-[#0F172A]">Active Query:</strong> {progress.currentUrl}
+              </div>
+            )}
           </div>
         )}
 
@@ -341,11 +460,11 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
         <div className="pt-2 border-t border-[#E2E8F0] flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px]">
           <div className="flex items-center gap-1.5 text-[#334155]">
             <Sparkles className="w-3.5 h-3.5 text-[#0284C7]" />
-            <span className="font-bold text-[#0F172A]">Local OSRM Script:</span>
-            <span>Run against <code className="bg-[#E2E8F0] px-1 py-0.2 rounded text-[#0F172A]">http://localhost:5001</code>:</span>
+            <span className="font-bold text-[#0F172A]">Local Terminal Script:</span>
+            <span>Run OSRM generation with custom URL:</span>
           </div>
           <code className="bg-[#0F172A] text-[#38BDF8] px-2 py-1 rounded text-[10px] select-all">
-            npx tsx scripts/generate_osrm_matrix.ts &lt;sales_register.xlsx&gt;
+            npx tsx scripts/generate_osrm_matrix.ts &lt;sales_register.xlsx&gt; ./distanceMatrix.xlsx {osrmUrl}
           </code>
         </div>
       </div>
@@ -354,7 +473,7 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            Unique Locations
+            Unique Locations (N)
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#0F172A]">
             {cachedMatrix ? cachedMatrix.locations.length : currentLocations.length}
@@ -378,12 +497,12 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
           <span className="text-[10px] font-bold text-[#64748B] font-mono uppercase tracking-wider block mb-0.5">
-            API Evaluated Pairs
+            OSRM Engine Evaluated
           </span>
           <div className="text-2xl font-mono font-extrabold text-[#0284C7]">
-            {cachedMatrix ? cachedMatrix.stats.osmTablePairs + cachedMatrix.stats.osmRoutePairs : 0}
+            {cachedMatrix ? (cachedMatrix.stats.osrmTablePairs ?? cachedMatrix.stats.osmTablePairs) : 0}
           </div>
-          <span className="text-[10px] font-mono text-[#94A3B8] block">OSM Road Network</span>
+          <span className="text-[10px] font-mono text-[#94A3B8] block">OSRM Road Network</span>
         </div>
 
         <div className="bg-white p-3 rounded-lg border border-[#E2E8F0] shadow-2xs">
@@ -530,7 +649,9 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                             {!isSame && distance != null && (
                               <span
                                 className={`text-[8px] font-bold px-1 py-0.2 rounded-xs mt-0.5 ${
-                                  source === 'osm-table'
+                                  source === 'osrm-table'
+                                    ? 'bg-[#F0F9FF] text-[#0284C7] border border-[#0EA5E933]'
+                                    : source === 'osm-table'
                                     ? 'bg-[#ECFDF5] text-[#059669] border border-[#10B98133]'
                                     : source === 'osm-route'
                                     ? 'bg-[#F0F9FF] text-[#0284C7] border border-[#0EA5E933]'
@@ -539,8 +660,10 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                                     : 'bg-[#FFFBEB] text-[#D97706] border border-[#F59E0B33]'
                                 }`}
                               >
-                                {source === 'osm-table'
-                                  ? 'OSM Table'
+                                {source === 'osrm-table'
+                                  ? 'OSRM Table'
+                                  : source === 'osm-table'
+                                  ? 'Public OSM'
                                   : source === 'osm-route'
                                   ? 'OSM Route'
                                   : source === 'manual'
@@ -564,12 +687,12 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
           <div className="flex items-center gap-3">
             <span className="font-bold text-[#0F172A] uppercase text-[10px]">Tier Legend:</span>
             <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-xs bg-[#059669]" />
-              <span>OSM Table</span>
+              <span className="w-2 h-2 rounded-xs bg-[#0284C7]" />
+              <span>OSRM Engine</span>
             </span>
             <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-xs bg-[#0284C7]" />
-              <span>OSM Route</span>
+              <span className="w-2 h-2 rounded-xs bg-[#059669]" />
+              <span>Public OSM</span>
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="w-2 h-2 rounded-xs bg-[#D97706]" />

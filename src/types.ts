@@ -62,17 +62,18 @@ export interface DistanceMatrixEntry {
   toName: string;
   distanceKm: number;
   durationMin: number;
-  source: 'osm-table' | 'osm-route' | 'haversine' | 'manual';
+  source: 'osrm-table' | 'osm-table' | 'osm-route' | 'haversine' | 'manual';
 }
 
 export interface DistanceMatrixData {
   locations: LocationPoint[];
   matrix: Record<string, Record<string, number>>; // [fromKey][toKey] = distance in km
   durations: Record<string, Record<string, number>>; // [fromKey][toKey] = duration in min
-  sources: Record<string, Record<string, 'osm-table' | 'osm-route' | 'haversine' | 'manual'>>;
+  sources: Record<string, Record<string, 'osrm-table' | 'osm-table' | 'osm-route' | 'haversine' | 'manual'>>;
   generatedAt: string;
   stats: {
     totalPairs: number;
+    osrmTablePairs?: number;
     osmTablePairs: number;
     osmRoutePairs: number;
     haversinePairs: number;
