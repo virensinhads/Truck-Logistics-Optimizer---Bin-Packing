@@ -75,6 +75,8 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
   const [activeResultView, setActiveResultView] = useState<'manifest' | 'table' | 'backlog' | 'logs'>('manifest');
   const [searchFilter, setSearchFilter] = useState('');
   const [selectedVehicleFilter, setSelectedVehicleFilter] = useState<string>('ALL');
+  const [selectedDropFilter, setSelectedDropFilter] = useState<string>('ALL');
+  const [selectedOrdersFilter, setSelectedOrdersFilter] = useState<string>('ALL');
   const [mapModalBatch, setMapModalBatch] = useState<VehicleDispatchBatch | null>(null);
   const [showFullFleetMap, setShowFullFleetMap] = useState(false);
   const [fileUploadError, setFileUploadError] = useState<string | null>(null);
@@ -193,6 +195,24 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
     }
   };
 
+  // Unique drop counts present in the result
+  const availableDropCounts = useMemo(() => {
+    if (!optimizationResult) return [1, 2, 3, 4];
+    const set = new Set<number>();
+    optimizationResult.dispatchedBatches.forEach((b) => set.add(b.stops.length));
+    const list = Array.from(set).sort((a, b) => a - b);
+    return list.length > 0 ? list : [1, 2, 3, 4];
+  }, [optimizationResult]);
+
+  // Unique order counts clubbed per FTL present in the result
+  const availableOrderCounts = useMemo(() => {
+    if (!optimizationResult) return [1, 2, 3, 4, 5];
+    const set = new Set<number>();
+    optimizationResult.dispatchedBatches.forEach((b) => set.add(b.orders.length));
+    const list = Array.from(set).sort((a, b) => a - b);
+    return list.length > 0 ? list : [1, 2, 3, 4, 5];
+  }, [optimizationResult]);
+
   // Filtered dispatched batches
   const filteredBatches = useMemo(() => {
     if (!optimizationResult) return [];
@@ -200,6 +220,16 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
 
     if (selectedVehicleFilter !== 'ALL') {
       batches = batches.filter((b) => b.vehicleType === selectedVehicleFilter);
+    }
+
+    if (selectedDropFilter !== 'ALL') {
+      const dropCount = parseInt(selectedDropFilter, 10);
+      batches = batches.filter((b) => b.stops.length === dropCount);
+    }
+
+    if (selectedOrdersFilter !== 'ALL') {
+      const orderCount = parseInt(selectedOrdersFilter, 10);
+      batches = batches.filter((b) => b.orders.length === orderCount);
     }
 
     if (searchFilter.trim()) {
@@ -213,7 +243,7 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
     }
 
     return batches;
-  }, [optimizationResult, selectedVehicleFilter, searchFilter]);
+  }, [optimizationResult, selectedVehicleFilter, selectedDropFilter, selectedOrdersFilter, searchFilter]);
 
   // Filtered all orders
   const filteredOrders = useMemo(() => {
@@ -764,18 +794,49 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
               </div>
 
               {/* Search & Filter */}
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {activeResultView === 'manifest' && (
-                  <select
-                    value={selectedVehicleFilter}
-                    onChange={(e) => setSelectedVehicleFilter(e.target.value)}
-                    className="px-2 py-1 rounded-sm border border-[#CBD5E1] text-xs font-mono bg-white text-[#0F172A] focus:outline-hidden"
-                  >
-                    <option value="ALL">All Fleets</option>
-                    <option value="25">25 MT Only</option>
-                    <option value="30">30 MT Only</option>
-                    <option value="35">35 MT Only</option>
-                  </select>
+                  <>
+                    <select
+                      id="select-fleet-filter"
+                      value={selectedVehicleFilter}
+                      onChange={(e) => setSelectedVehicleFilter(e.target.value)}
+                      className="px-2 py-1 rounded-sm border border-[#CBD5E1] text-xs font-mono bg-white text-[#0F172A] focus:outline-hidden cursor-pointer"
+                    >
+                      <option value="ALL">All Fleets</option>
+                      <option value="25">25 MT Only</option>
+                      <option value="30">30 MT Only</option>
+                      <option value="35">35 MT Only</option>
+                    </select>
+
+                    <select
+                      id="select-drop-filter"
+                      value={selectedDropFilter}
+                      onChange={(e) => setSelectedDropFilter(e.target.value)}
+                      className="px-2 py-1 rounded-sm border border-[#CBD5E1] text-xs font-mono bg-white text-[#0F172A] focus:outline-hidden cursor-pointer"
+                    >
+                      <option value="ALL">All Drops</option>
+                      {availableDropCounts.map((count) => (
+                        <option key={count} value={count.toString()}>
+                          {count} {count === 1 ? 'Drop' : 'Drops'}
+                        </option>
+                      ))}
+                    </select>
+
+                    <select
+                      id="select-orders-filter"
+                      value={selectedOrdersFilter}
+                      onChange={(e) => setSelectedOrdersFilter(e.target.value)}
+                      className="px-2 py-1 rounded-sm border border-[#CBD5E1] text-xs font-mono bg-white text-[#0F172A] focus:outline-hidden cursor-pointer"
+                    >
+                      <option value="ALL">All Orders/Truck</option>
+                      {availableOrderCounts.map((count) => (
+                        <option key={count} value={count.toString()}>
+                          {count} {count === 1 ? 'Order' : 'Orders'} Clubbed
+                        </option>
+                      ))}
+                    </select>
+                  </>
                 )}
 
                 <div className="relative">
@@ -795,8 +856,21 @@ export const TabOptimization: React.FC<TabOptimizationProps> = ({
             {activeResultView === 'manifest' && (
               <div className="p-4 divide-y divide-[#E2E8F0] space-y-3">
                 {filteredBatches.length === 0 ? (
-                  <div className="p-6 text-center text-[#94A3B8] font-mono text-xs">
-                    No vehicle dispatches match the selected filter.
+                  <div className="p-8 text-center text-[#64748B] font-mono text-xs space-y-2">
+                    <p>No vehicle dispatches match the selected fleet, drop count, clubbed order count, or search filter.</p>
+                    {(selectedVehicleFilter !== 'ALL' || selectedDropFilter !== 'ALL' || selectedOrdersFilter !== 'ALL' || searchFilter.trim()) && (
+                      <button
+                        onClick={() => {
+                          setSelectedVehicleFilter('ALL');
+                          setSelectedDropFilter('ALL');
+                          setSelectedOrdersFilter('ALL');
+                          setSearchFilter('');
+                        }}
+                        className="px-3 py-1 text-[11px] font-bold text-[#0284C7] bg-[#E0F2FE] hover:bg-[#BAE6FD] rounded cursor-pointer transition"
+                      >
+                        Reset All Filters
+                      </button>
+                    )}
                   </div>
                 ) : (
                   filteredBatches.map((batch) => (

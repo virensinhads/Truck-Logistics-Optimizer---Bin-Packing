@@ -2,7 +2,7 @@ import { DistanceMatrixData, LocationPoint, DistanceMatrixEntry } from '../types
 import { computeHaversineDistanceKm, estimateDrivingDurationMin } from './haversine';
 import * as XLSX from 'xlsx';
 
-export const DEFAULT_OSRM_URL = 'http://192.168.157.174:5001';
+export const DEFAULT_OSRM_URL = 'https://specializing-marvel-configuration-but.trycloudflare.com';
 export const FALLBACK_PUBLIC_OSM_URL = 'https://routing.openstreetmap.de/routed-car';
 
 // Local storage keys for persisting distance matrix and custom OSRM endpoint
@@ -170,6 +170,251 @@ export async function queryOsrmTableForSource(
     return {
       ...getFallbackRow('haversine'),
       errorMessage: err?.message || 'Connection failed',
+    };
+  }
+}
+
+// In-memory cache for fetched pairwise road route segments by coordinate key string
+const singleLegRoadGeometryCache = new Map<string, {
+  coordinates: [number, number][];
+  distanceKm: number;
+  durationMin: number;
+  source: 'osrm-road' | 'fallback';
+}>();
+
+/**
+ * Fetches actual road network route geometry for a single leg between 2 points (from -> to)
+ */
+export async function fetchSingleLegRoadGeometry(
+  from: { lat: number; lon: number },
+  to: { lat: number; lon: number },
+  baseUrl?: string,
+  timeoutMs = 7000
+): Promise<{ coordinates: [number, number][]; distanceKm: number; durationMin: number; source: 'osrm-road' | 'fallback' }> {
+  const cacheKey = `${from.lat.toFixed(6)},${from.lon.toFixed(6)}->${to.lat.toFixed(6)},${to.lon.toFixed(6)}`;
+  const cached = singleLegRoadGeometryCache.get(cacheKey);
+  if (cached) return cached;
+
+  const activeBase = (baseUrl || loadOsrmBaseUrlFromStorage() || DEFAULT_OSRM_URL).trim().replace(/\/+$/, '');
+  const coordsParam = `${from.lon},${from.lat};${to.lon},${to.lat}`;
+  const primaryUrl = `${activeBase}/route/v1/driving/${coordsParam}?overview=full&geometries=geojson`;
+
+  // 1. Try Primary OSRM Endpoint
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const res = await fetch(primaryUrl, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timer);
+
+    if (res.ok) {
+      const data: any = await res.json();
+      if (data.code === 'Ok' && data.routes?.[0]?.geometry?.coordinates) {
+        const rawCoords: [number, number][] = data.routes[0].geometry.coordinates;
+        const result = {
+          coordinates: rawCoords.map(([lon, lat]) => [lat, lon] as [number, number]),
+          distanceKm: Math.round(((data.routes[0].distance || 0) / 1000) * 100) / 100,
+          durationMin: Math.round(((data.routes[0].duration || 0) / 60) * 10) / 10,
+          source: 'osrm-road' as const,
+        };
+        singleLegRoadGeometryCache.set(cacheKey, result);
+        return result;
+      }
+    }
+  } catch {
+    // Primary failed, continue to fallback
+  }
+
+  // 2. Try Public OSRM router fallback if different from primary
+  if (!activeBase.includes('project-osrm.org')) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const publicUrl = `https://router.project-osrm.org/route/v1/driving/${coordsParam}?overview=full&geometries=geojson`;
+      const pubRes = await fetch(publicUrl, { signal: controller.signal, headers: { Accept: 'application/json' } });
+      clearTimeout(timer);
+
+      if (pubRes.ok) {
+        const pubData: any = await pubRes.json();
+        if (pubData.code === 'Ok' && pubData.routes?.[0]?.geometry?.coordinates) {
+          const rawCoords: [number, number][] = pubData.routes[0].geometry.coordinates;
+          const result = {
+            coordinates: rawCoords.map(([lon, lat]) => [lat, lon] as [number, number]),
+            distanceKm: Math.round(((pubData.routes[0].distance || 0) / 1000) * 100) / 100,
+            durationMin: Math.round(((pubData.routes[0].duration || 0) / 60) * 10) / 10,
+            source: 'osrm-road' as const,
+          };
+          singleLegRoadGeometryCache.set(cacheKey, result);
+          return result;
+        }
+      }
+    } catch {
+      // Fallback failed
+    }
+  }
+
+  // 3. Fallback straight line
+  const dKm = computeHaversineDistanceKm(from.lat, from.lon, to.lat, to.lon);
+  const fallbackResult = {
+    coordinates: [
+      [from.lat, from.lon] as [number, number],
+      [to.lat, to.lon] as [number, number],
+    ],
+    distanceKm: Math.round(dKm * 100) / 100,
+    durationMin: Math.round(((dKm / 40) * 60) * 10) / 10,
+    source: 'fallback' as const,
+  };
+  singleLegRoadGeometryCache.set(cacheKey, fallbackResult);
+  return fallbackResult;
+}
+
+export interface RouteLegDetail {
+  fromIndex: number;
+  toIndex: number;
+  fromDest?: string;
+  toDest?: string;
+  coordinates: [number, number][];
+  distanceKm: number;
+  durationMin: number;
+  source: 'osrm-road' | 'fallback';
+}
+
+/**
+ * Fetches actual road network route geometry for a multi-stop sequence.
+ * Rather than clubbing all points into a single multi-waypoint request (which can produce unwanted U-turns/detours),
+ * this executes N-1 pairwise point-to-point road queries (Leg 1: S1->S2, Leg 2: S2->S3, ...) in parallel,
+ * resulting in optimal path accuracy matching direct point-to-point navigation.
+ */
+export async function fetchRoadRouteGeometry(
+  stops: { lat: number; lon: number; dest?: string }[],
+  baseUrl?: string,
+  timeoutMs = 8000
+): Promise<{
+  coordinates: [number, number][];
+  distanceKm: number;
+  durationMin: number;
+  source: 'osrm-road' | 'fallback';
+  legs: RouteLegDetail[];
+} | null> {
+  if (!stops || stops.length < 2) return null;
+
+  // Build N - 1 pairwise leg promises
+  const legPromises: Promise<RouteLegDetail>[] = [];
+
+  for (let i = 0; i < stops.length - 1; i++) {
+    const fromStop = stops[i];
+    const toStop = stops[i + 1];
+
+    legPromises.push(
+      fetchSingleLegRoadGeometry(fromStop, toStop, baseUrl, timeoutMs).then((res) => ({
+        fromIndex: i + 1,
+        toIndex: i + 2,
+        fromDest: fromStop.dest,
+        toDest: toStop.dest,
+        coordinates: res.coordinates,
+        distanceKm: res.distanceKm,
+        durationMin: res.durationMin,
+        source: res.source,
+      }))
+    );
+  }
+
+  const legs = await Promise.all(legPromises);
+
+  // Merge coordinates without duplicate boundary vertices
+  const combinedCoordinates: [number, number][] = [];
+  let totalDistanceKm = 0;
+  let totalDurationMin = 0;
+  let hasRoadSource = false;
+
+  legs.forEach((leg, idx) => {
+    totalDistanceKm += leg.distanceKm;
+    totalDurationMin += leg.durationMin;
+    if (leg.source === 'osrm-road') hasRoadSource = true;
+
+    if (idx === 0) {
+      combinedCoordinates.push(...leg.coordinates);
+    } else {
+      // Avoid duplicating the junction point
+      if (leg.coordinates.length > 1) {
+        combinedCoordinates.push(...leg.coordinates.slice(1));
+      } else {
+        combinedCoordinates.push(...leg.coordinates);
+      }
+    }
+  });
+
+  return {
+    coordinates: combinedCoordinates,
+    distanceKm: Math.round(totalDistanceKm * 100) / 100,
+    durationMin: Math.round(totalDurationMin * 10) / 10,
+    source: hasRoadSource ? 'osrm-road' : 'fallback',
+    legs,
+  };
+}
+
+/**
+ * Tests connection to a given OSRM base URL using a sample 2-point driving table query
+ */
+export async function testOsrmEndpoint(
+  baseUrl: string,
+  timeoutMs = 6000
+): Promise<{ success: boolean; message: string; latencyMs?: number; code?: string }> {
+  const cleanBase = (baseUrl || DEFAULT_OSRM_URL).trim().replace(/\/+$/, '');
+  const testUrl = `${cleanBase}/table/v1/driving/92.2072,23.946;92.74221,24.689?annotations=distance,duration&sources=0`;
+  const start = Date.now();
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const res = await fetch(testUrl, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timer);
+
+    const latencyMs = Date.now() - start;
+
+    if (!res.ok) {
+      return {
+        success: false,
+        message: `HTTP ${res.status}: ${res.statusText}`,
+        latencyMs,
+      };
+    }
+
+    const data: any = await res.json();
+    if (data.code === 'Ok' && Array.isArray(data.distances) && data.distances.length > 0) {
+      return {
+        success: true,
+        message: `Connected successfully (${latencyMs}ms)! OSRM Table API is active and responsive.`,
+        latencyMs,
+        code: data.code,
+      };
+    }
+
+    return {
+      success: false,
+      message: `OSRM returned code: "${data.code || 'Unknown'}"`,
+      latencyMs,
+    };
+  } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    if (err.name === 'AbortError') {
+      return {
+        success: false,
+        message: `Connection timed out after ${timeoutMs / 1000}s. Check if server is running and reachable.`,
+        latencyMs,
+      };
+    }
+    return {
+      success: false,
+      message: err.message || 'Connection failed. Check network, protocol (http vs https), or CORS.',
+      latencyMs,
     };
   }
 }

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Truck, MapPin, Layers, Info, CheckCircle2, Sliders, FileSpreadsheet, X, ShieldAlert } from 'lucide-react';
+import { Truck, MapPin, Layers, Info, CheckCircle2, Sliders, FileSpreadsheet, X, ShieldAlert, Presentation, Download } from 'lucide-react';
 import { DistanceMatrixData, OptimizationConfig } from '../types';
+import { generateAppPresentation } from '../utils/presentationGenerator';
 
 interface NavbarProps {
   activeTab: 'matrix' | 'optimization';
@@ -16,6 +17,18 @@ export const Navbar: React.FC<NavbarProps> = ({
   config,
 }) => {
   const [showRulesModal, setShowRulesModal] = useState(false);
+  const [isGeneratingPpt, setIsGeneratingPpt] = useState(false);
+
+  const handleDownloadPresentation = async () => {
+    try {
+      setIsGeneratingPpt(true);
+      await generateAppPresentation();
+    } catch (err) {
+      console.error('Failed to generate presentation', err);
+    } finally {
+      setIsGeneratingPpt(false);
+    }
+  };
 
   return (
     <header className="h-14 bg-[#0F172A] flex items-center justify-between px-4 sm:px-6 border-b border-[#334155] text-white sticky top-0 z-30">
@@ -89,6 +102,18 @@ export const Navbar: React.FC<NavbarProps> = ({
             </span>
           )}
         </div>
+
+        <button
+          id="btn-download-guide-ppt"
+          onClick={handleDownloadPresentation}
+          disabled={isGeneratingPpt}
+          className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-mono font-medium rounded-sm bg-[#0284C7] hover:bg-[#0369A1] text-white transition-colors cursor-pointer shadow-2xs"
+          title="Download 5-Slide Visual PPT User Guide (.pptx)"
+        >
+          <Presentation className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">{isGeneratingPpt ? 'Creating PPT...' : 'User Guide PPT'}</span>
+          <Download className="w-3 h-3 hidden md:inline" />
+        </button>
 
         <button
           id="btn-rules-info"

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Upload,
   RefreshCw,
@@ -16,6 +16,11 @@ import {
   FileText,
   Truck,
   ArrowRight,
+  Globe,
+  Server,
+  RotateCcw,
+  Radio,
+  ExternalLink,
 } from 'lucide-react';
 import { DistanceMatrixData, LocationPoint, OrderLineItem } from '../types';
 import {
@@ -25,6 +30,9 @@ import {
   exportDistanceMatrixToJson,
   saveDistanceMatrixToStorage,
   DEFAULT_OSRM_URL,
+  loadOsrmBaseUrlFromStorage,
+  saveOsrmBaseUrlToStorage,
+  testOsrmEndpoint,
 } from '../utils/distanceMatrixEngine';
 import { SAMPLE_SALES_REGISTER_ORDERS } from '../utils/sampleData';
 import {
@@ -50,6 +58,17 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
   const [isUploadingMatrix, setIsUploadingMatrix] = useState(false);
   const [uploadedSalesFileName, setUploadedSalesFileName] = useState<string | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
+
+  // OSRM Base URL state & endpoint test
+  const [osrmBaseUrl, setOsrmBaseUrl] = useState<string>(() => {
+    return loadOsrmBaseUrlFromStorage() || DEFAULT_OSRM_URL;
+  });
+  const [isTestingOsrm, setIsTestingOsrm] = useState(false);
+  const [osrmTestResult, setOsrmTestResult] = useState<{
+    success: boolean;
+    message: string;
+    latencyMs?: number;
+  } | null>(null);
 
   const [progress, setProgress] = useState<{
     percent: number;
@@ -77,6 +96,42 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
   const salesFileInputRef = useRef<HTMLInputElement>(null);
   const matrixFileInputRef = useRef<HTMLInputElement>(null);
 
+  // Handle URL change
+  const handleOsrmUrlChange = (newUrl: string) => {
+    setOsrmBaseUrl(newUrl);
+    saveOsrmBaseUrlToStorage(newUrl.trim());
+    setOsrmTestResult(null);
+  };
+
+  // Handle URL reset to default
+  const handleResetOsrmUrl = () => {
+    setOsrmBaseUrl(DEFAULT_OSRM_URL);
+    saveOsrmBaseUrlToStorage(DEFAULT_OSRM_URL);
+    setOsrmTestResult(null);
+    setStatusMessage({
+      text: `Reset OSRM base URL to default (${DEFAULT_OSRM_URL})`,
+      type: 'info',
+    });
+  };
+
+  // Handle testing the OSRM endpoint
+  const handleTestOsrmConnection = async () => {
+    if (!osrmBaseUrl.trim()) {
+      setOsrmTestResult({ success: false, message: 'Please enter a valid OSRM base URL' });
+      return;
+    }
+    setIsTestingOsrm(true);
+    setOsrmTestResult(null);
+    try {
+      const res = await testOsrmEndpoint(osrmBaseUrl.trim());
+      setOsrmTestResult(res);
+    } catch (err: any) {
+      setOsrmTestResult({ success: false, message: err?.message || 'Failed to connect to endpoint' });
+    } finally {
+      setIsTestingOsrm(false);
+    }
+  };
+
   // Derive unique locations from activeOrders or sample data
   const currentLocations: LocationPoint[] = useMemo(() => {
     if (activeOrders.length > 0) {
@@ -96,8 +151,9 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
     setStatusMessage(null);
 
     try {
+      const activeUrl = osrmBaseUrl.trim() || DEFAULT_OSRM_URL;
       const matrixData = await generateDistanceMatrix(currentLocations, {
-        osrmBaseUrl: DEFAULT_OSRM_URL,
+        osrmBaseUrl: activeUrl,
         onProgress: (p) => {
           setProgress(p);
         },
@@ -366,6 +422,96 @@ export const TabDistanceMatrix: React.FC<TabDistanceMatrixProps> = ({
                 className="hidden"
               />
             </label>
+          </div>
+        </div>
+
+        {/* OSRM Table API Base URL Configuration */}
+        <div className="mt-4 pt-4 border-t border-[#E2E8F0]">
+          <div className="p-3.5 sm:p-4 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0] space-y-2.5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Server className="w-4 h-4 text-[#0284C7]" />
+                <label htmlFor="input-osrm-base-url" className="text-xs font-mono font-bold text-[#0F172A]">
+                  OSRM Table API Base URL
+                </label>
+                <span className="px-1.5 py-0.5 rounded bg-[#E0F2FE] text-[#0369A1] text-[10px] font-mono font-semibold">
+                  Script 1 Endpoint
+                </span>
+              </div>
+              <div className="text-[11px] text-[#64748B] font-mono">
+                Query endpoint: <code className="text-[#0F172A] bg-white px-1 py-0.5 rounded border border-[#E2E8F0]">&#123;baseUrl&#125;/table/v1/driving/...</code>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <div className="relative flex-1">
+                <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-[#94A3B8]">
+                  <Globe className="w-4 h-4" />
+                </div>
+                <input
+                  id="input-osrm-base-url"
+                  type="text"
+                  value={osrmBaseUrl}
+                  onChange={(e) => handleOsrmUrlChange(e.target.value)}
+                  placeholder="e.g. https://your-osrm-server.com or http://192.168.1.100:5000"
+                  className="w-full pl-8 pr-3 py-1.5 bg-white border border-[#CBD5E1] rounded-sm text-xs font-mono text-[#0F172A] placeholder-[#94A3B8] focus:outline-hidden focus:border-[#0284C7] focus:ring-1 focus:ring-[#0284C7] transition"
+                />
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  id="btn-test-osrm-endpoint"
+                  onClick={handleTestOsrmConnection}
+                  disabled={isTestingOsrm || !osrmBaseUrl.trim()}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-sm text-xs font-mono font-semibold border transition shadow-2xs cursor-pointer ${
+                    isTestingOsrm
+                      ? 'bg-[#F1F5F9] text-[#64748B] border-[#CBD5E1] cursor-wait'
+                      : 'bg-white hover:bg-[#F1F5F9] text-[#0F172A] border-[#CBD5E1]'
+                  }`}
+                  title="Test if OSRM Table API is accessible and responding"
+                >
+                  <Radio className={`w-3.5 h-3.5 ${isTestingOsrm ? 'animate-pulse text-[#0284C7]' : 'text-[#0284C7]'}`} />
+                  <span>{isTestingOsrm ? 'Testing...' : 'Test Connection'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  id="btn-reset-osrm-url"
+                  onClick={handleResetOsrmUrl}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-sm text-xs font-mono text-[#64748B] hover:text-[#0F172A] hover:bg-[#F1F5F9] border border-transparent hover:border-[#CBD5E1] transition cursor-pointer"
+                  title="Reset to default OSRM endpoint"
+                >
+                  <RotateCcw className="w-3 h-3 text-[#64748B]" />
+                  <span>Default</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Test result feedback banner */}
+            {osrmTestResult && (
+              <div
+                className={`p-2 rounded text-[11px] font-mono flex items-center justify-between gap-2 border ${
+                  osrmTestResult.success
+                    ? 'bg-[#F0FDF4] border-[#86EFAC] text-[#166534]'
+                    : 'bg-[#FEF2F2] border-[#FECACA] text-[#991B1B]'
+                }`}
+              >
+                <div className="flex items-center gap-1.5">
+                  {osrmTestResult.success ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 text-[#DC2626] shrink-0" />
+                  )}
+                  <span>{osrmTestResult.message}</span>
+                </div>
+                {osrmTestResult.latencyMs !== undefined && (
+                  <span className="shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded bg-white/70">
+                    {osrmTestResult.latencyMs} ms
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
