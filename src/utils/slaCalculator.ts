@@ -284,6 +284,160 @@ export function calculateOrderSla(
 }
 
 /**
+ * Formats a delay duration in minutes to a human-readable string (e.g. "+3.5 hrs", "+1d 4h", "SLA Met")
+ */
+export function formatDelayString(delayMinutes: number): string {
+  if (delayMinutes <= 0) return 'SLA Met';
+  const hours = delayMinutes / 60;
+  if (delayMinutes < 60) {
+    return `+${delayMinutes}m delay`;
+  }
+  if (delayMinutes < 1440) {
+    return `+${(Math.round(hours * 10) / 10).toFixed(1)} hrs`;
+  }
+  const days = Math.floor(delayMinutes / 1440);
+  const remHours = Math.round(((delayMinutes % 1440) / 60) * 10) / 10;
+  return `+${days}d ${remHours > 0 ? `${remHours}h` : ''} (+${hours.toFixed(1)}h)`;
+}
+
+/**
+ * Parses an E-Way Bill date & time string, serial timestamp, or Date object
+ */
+export function parseEWayBillTimestamp(
+  ewbVal: any,
+  fallbackDateStr?: string,
+  fallbackTimeStr?: string
+): { timestamp: number; formatted: string } | null {
+  if (ewbVal === null || ewbVal === undefined || ewbVal === '') {
+    if (!fallbackDateStr) return null;
+    const pDate = parseDateString(fallbackDateStr);
+    if (!pDate) return null;
+    const pTime = parseTimeString(fallbackTimeStr || '18:00:00');
+    const dt = new Date(pDate.year, pDate.month - 1, pDate.day, pTime.hours, pTime.minutes, pTime.seconds);
+    return {
+      timestamp: dt.getTime(),
+      formatted: formatTimestamp(dt),
+    };
+  }
+
+  // If already a JS Date
+  if (ewbVal instanceof Date && !isNaN(ewbVal.getTime())) {
+    return {
+      timestamp: ewbVal.getTime(),
+      formatted: formatTimestamp(ewbVal),
+    };
+  }
+
+  // If Excel serial number (integer date + fractional time)
+  if (typeof ewbVal === 'number') {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    const targetDate = new Date(excelEpoch.getTime() + ewbVal * 86400000);
+    return {
+      timestamp: targetDate.getTime(),
+      formatted: formatTimestamp(targetDate),
+    };
+  }
+
+  const str = String(ewbVal).trim();
+  if (!str || str.toLowerCase() === 'na' || str.toLowerCase() === 'null') {
+    return null;
+  }
+
+  // If ISO string e.g. "2026-10-01T14:30:00"
+  if (str.includes('T')) {
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) {
+      return {
+        timestamp: d.getTime(),
+        formatted: formatTimestamp(d),
+      };
+    }
+  }
+
+  // Try parsing date and time components
+  const pDate = parseDateString(str);
+  if (pDate) {
+    let timeStr = '';
+    const parts = str.split(/[ T]/).filter(Boolean);
+    if (parts.length > 1) {
+      timeStr = parts.slice(1).join(' ');
+    }
+    const pTime = timeStr ? parseTimeString(timeStr) : parseTimeString(fallbackTimeStr || '18:00:00');
+    const dt = new Date(pDate.year, pDate.month - 1, pDate.day, pTime.hours, pTime.minutes, pTime.seconds);
+    return {
+      timestamp: dt.getTime(),
+      formatted: formatTimestamp(dt),
+    };
+  }
+
+  // Fallback to JS Date parse
+  const fallback = new Date(str);
+  if (!isNaN(fallback.getTime())) {
+    return {
+      timestamp: fallback.getTime(),
+      formatted: formatTimestamp(fallback),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Calculates the SLA window and compares against historical E-Way Bill date & time to measure SLA breaches and delays
+ */
+export function evaluateOrderSlaWithActuals(
+  order: OrderLineItem,
+  slaWindowHours: number,
+  shiftStartStr: string = '10:00',
+  shiftEndStr: string = '17:00'
+): NonNullable<OrderLineItem['calculatedSla']> {
+  const soDate = order.soPoDate || order.rawRowData?.['SO/PO Date'] || order.rawRowData?.['SO Date'] || order.rawRowData?.['PO Date'] || '01/10/2026';
+  const soTime = order.soStoCreationTime || order.rawRowData?.['SO/STO creation time'] || order.rawRowData?.['Creation Time'] || '10:00:00';
+
+  const baseSla = calculateOrderSla(soDate, soTime, slaWindowHours, shiftStartStr, shiftEndStr);
+
+  // Extract E-Way Bill value
+  const rawEwb = order.eWayBillDateTime 
+    || order.rawRowData?.['E-Way Bill date & time']
+    || order.rawRowData?.['E-Way Bill Date & Time']
+    || order.rawRowData?.['Eway Bill date & time']
+    || order.rawRowData?.['E-Way Bill Date/Time']
+    || order.eWayBillDate
+    || order.rawRowData?.['E-Way Bill Date']
+    || order.rawRowData?.['Dispatch Date'];
+
+  const ewbParsed = parseEWayBillTimestamp(rawEwb, order.eWayBillDate || soDate, soTime);
+
+  let isSlaBreached = false;
+  let delayMinutes = 0;
+  let delayHours = 0;
+  let formattedDelay = 'SLA Met';
+
+  if (ewbParsed) {
+    const diffMs = ewbParsed.timestamp - baseSla.expiryTimestamp;
+    if (diffMs > 0) {
+      delayMinutes = Math.round(diffMs / 60000);
+      delayHours = Math.round((delayMinutes / 60) * 10) / 10;
+      isSlaBreached = delayMinutes > 0;
+      formattedDelay = formatDelayString(delayMinutes);
+    }
+  }
+
+  const enrichedSla = {
+    ...baseSla,
+    eWayBillTimestamp: ewbParsed?.timestamp,
+    formattedEWayBillTime: ewbParsed?.formatted,
+    isSlaBreached,
+    delayMinutes,
+    delayHours,
+    formattedDelay,
+  };
+
+  order.calculatedSla = enrichedSla;
+  return enrichedSla;
+}
+
+/**
  * Checks if a group of orders share an overlapping SLA dispatch window.
  * All orders batched together MUST overlap:
  * max(effectiveStartTimestamps) <= min(expiryTimestamps)

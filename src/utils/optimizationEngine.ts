@@ -96,10 +96,198 @@ export function selectBestVehicleForWeight(
   return null;
 }
 
+export interface DestinationStopGroup {
+  dest: string;
+  lat: number;
+  lon: number;
+  orders: OrderLineItem[];
+  totalWeight: number;
+  maxOrderWeight: number;
+  earliestExpiry: number;
+}
+
+/**
+ * Computes all permutations of an array
+ */
+function getPermutations<T>(items: T[]): T[][] {
+  if (items.length <= 1) return [items];
+  const perms: T[][] = [];
+  for (let i = 0; i < items.length; i++) {
+    const current = items[i];
+    const remaining = items.slice(0, i).concat(items.slice(i + 1));
+    const subPerms = getPermutations(remaining);
+    for (const sp of subPerms) {
+      perms.push([current, ...sp]);
+    }
+  }
+  return perms;
+}
+
+/**
+ * Compares two stop groups to determine which is better as a primary / first drop stop
+ * Priority: 1. Higher total tonnage -> 2. Higher single order weight -> 3. Earliest SLA expiry
+ */
+function compareStopPriority(a: DestinationStopGroup, b: DestinationStopGroup): number {
+  if (Math.abs(b.totalWeight - a.totalWeight) > 0.001) {
+    return b.totalWeight - a.totalWeight;
+  }
+  if (Math.abs(b.maxOrderWeight - a.maxOrderWeight) > 0.001) {
+    return b.maxOrderWeight - a.maxOrderWeight;
+  }
+  return a.earliestExpiry - b.earliestExpiry;
+}
+
+/**
+ * Calculates total route distance across a sequence of stops
+ */
+function computeSequenceDistance(
+  seq: DestinationStopGroup[],
+  getDist: (a: DestinationStopGroup, b: DestinationStopGroup) => number
+): number {
+  let dist = 0;
+  for (let i = 0; i < seq.length - 1; i++) {
+    dist += getDist(seq[i], seq[i + 1]);
+  }
+  return dist;
+}
+
+/**
+ * Finds the combination (permutation of drop points) that yields the minimum total inter-drop distance.
+ * When there is more than 2 drop points, all route combinations are evaluated to find the global minimum path.
+ * When multiple combinations yield the same minimal total distance (e.g. reverse chains A->B->C vs C->B->A),
+ * ties are broken by starting with the stop that has the highest payload weight / priority.
+ */
+export function optimizeRouteStopSequence(
+  distinctDests: DestinationStopGroup[],
+  getDist: (a: DestinationStopGroup, b: DestinationStopGroup) => number
+): { sequencedDests: DestinationStopGroup[]; totalDistanceKm: number } {
+  if (distinctDests.length === 0) {
+    return { sequencedDests: [], totalDistanceKm: 0 };
+  }
+  if (distinctDests.length === 1) {
+    return { sequencedDests: [distinctDests[0]], totalDistanceKm: 0 };
+  }
+
+  // If 2 drops, evaluate [A, B] and [B, A]
+  if (distinctDests.length === 2) {
+    const [A, B] = distinctDests;
+    const distAB = getDist(A, B);
+    const distBA = getDist(B, A);
+
+    // If asymmetric road distances differ significantly, pick shorter road direction
+    if (Math.abs(distAB - distBA) > 0.01) {
+      if (distAB < distBA) {
+        return { sequencedDests: [A, B], totalDistanceKm: distAB };
+      } else {
+        return { sequencedDests: [B, A], totalDistanceKm: distBA };
+      }
+    }
+
+    // If distances are equal / symmetric: choose starting stop with higher weight
+    const startWithA = compareStopPriority(A, B) <= 0;
+    const chosen = startWithA ? [A, B] : [B, A];
+    return {
+      sequencedDests: chosen,
+      totalDistanceKm: startWithA ? distAB : distBA,
+    };
+  }
+
+  // When there is more than 2 drop points:
+  // For standard multi-drop batches (N <= 8), evaluate all N! permutations to guarantee the exact minimum total distance
+  if (distinctDests.length <= 8) {
+    const allPerms = getPermutations(distinctDests);
+    let bestSeq = allPerms[0];
+    let minDistance = Infinity;
+
+    for (const perm of allPerms) {
+      const dist = computeSequenceDistance(perm, getDist);
+
+      if (dist < minDistance - 0.001) {
+        minDistance = dist;
+        bestSeq = perm;
+      } else if (Math.abs(dist - minDistance) <= 0.001) {
+        // Equal minimum distance tie-breaker:
+        // Compare starting stops first, then subsequent stops
+        let isBetter = false;
+        for (let i = 0; i < perm.length; i++) {
+          const comp = compareStopPriority(perm[i], bestSeq[i]);
+          if (comp < 0) {
+            isBetter = true;
+            break;
+          } else if (comp > 0) {
+            isBetter = false;
+            break;
+          }
+        }
+        if (isBetter) {
+          bestSeq = perm;
+        }
+      }
+    }
+
+    return {
+      sequencedDests: bestSeq,
+      totalDistanceKm: Math.round(minDistance * 100) / 100,
+    };
+  }
+
+  // Fallback for large N (> 8 stops in a single truck): Multi-start nearest neighbor + 2-opt
+  let bestSeq = [...distinctDests];
+  let minDistance = Infinity;
+
+  for (let startIdx = 0; startIdx < distinctDests.length; startIdx++) {
+    const remaining = [...distinctDests];
+    const currentSeq = [remaining.splice(startIdx, 1)[0]];
+
+    while (remaining.length > 0) {
+      const last = currentSeq[currentSeq.length - 1];
+      let nearestIdx = 0;
+      let shortestD = Infinity;
+
+      for (let j = 0; j < remaining.length; j++) {
+        const d = getDist(last, remaining[j]);
+        if (d < shortestD) {
+          shortestD = d;
+          nearestIdx = j;
+        }
+      }
+      currentSeq.push(remaining.splice(nearestIdx, 1)[0]);
+    }
+
+    // 2-opt local search
+    let improved = true;
+    while (improved) {
+      improved = false;
+      for (let i = 0; i < currentSeq.length - 2; i++) {
+        for (let k = i + 1; k < currentSeq.length - 1; k++) {
+          const currentDist = getDist(currentSeq[i], currentSeq[i + 1]) + getDist(currentSeq[k], currentSeq[k + 1]);
+          const newDist = getDist(currentSeq[i], currentSeq[k]) + getDist(currentSeq[i + 1], currentSeq[k + 1]);
+          if (newDist < currentDist - 0.001) {
+            const reversed = currentSeq.slice(i + 1, k + 1).reverse();
+            currentSeq.splice(i + 1, reversed.length, ...reversed);
+            improved = true;
+          }
+        }
+      }
+    }
+
+    const totalD = computeSequenceDistance(currentSeq, getDist);
+    if (totalD < minDistance) {
+      minDistance = totalD;
+      bestSeq = currentSeq;
+    }
+  }
+
+  return {
+    sequencedDests: bestSeq,
+    totalDistanceKm: Math.round(minDistance * 100) / 100,
+  };
+}
+
 /**
  * Determines stop sequence and first drop rule for a batch of orders.
- * Rule: First drop (Stop 1) is the destination of the highest-weight order line item
- * (ties broken by earliest SLA expiry). Subsequent stops are ordered to minimize route distance.
+ * When there are > 2 drop points, the combination with minimum total inter-drop distance is chosen.
+ * Stop 1 (First Drop) is the initial drop point of this optimal route combination.
  */
 export function buildRouteStops(
   orders: OrderLineItem[],
@@ -110,7 +298,7 @@ export function buildRouteStops(
   }
 
   // Group orders by destination/coordinates
-  const destMap = new Map<string, { dest: string; lat: number; lon: number; orders: OrderLineItem[]; totalWeight: number; maxOrderWeight: number; earliestExpiry: number }>();
+  const destMap = new Map<string, DestinationStopGroup>();
 
   for (const order of orders) {
     const key = `${order.dest.trim().toLowerCase()}_${order.lat.toFixed(4)}_${order.lon.toFixed(4)}`;
@@ -142,41 +330,13 @@ export function buildRouteStops(
 
   const distinctDests = Array.from(destMap.values());
 
-  // Find the First Drop (Stop 1): destination of the highest-weight single order line item (tie broken by earliest SLA)
-  distinctDests.sort((a, b) => {
-    if (b.maxOrderWeight !== a.maxOrderWeight) {
-      return b.maxOrderWeight - a.maxOrderWeight;
-    }
-    return a.earliestExpiry - b.earliestExpiry;
-  });
+  // Optimize stop sequence to minimize total inter-drop distance across all drop points
+  const { sequencedDests, totalDistanceKm } = optimizeRouteStopSequence(
+    distinctDests,
+    (a, b) => getDistanceBetweenPoints(a.lat, a.lon, b.lat, b.lon, cachedMatrix)
+  );
 
-  const firstDest = distinctDests[0];
-  const remainingDests = distinctDests.slice(1);
-
-  // Sequence remaining stops by nearest neighbor from previous stop
-  const sequencedDests = [firstDest];
-  let currentLoc = firstDest;
-
-  while (remainingDests.length > 0) {
-    let nearestIdx = 0;
-    let shortestDist = Infinity;
-
-    for (let i = 0; i < remainingDests.length; i++) {
-      const candidate = remainingDests[i];
-      const dist = getDistanceBetweenPoints(currentLoc.lat, currentLoc.lon, candidate.lat, candidate.lon, cachedMatrix);
-      if (dist < shortestDist) {
-        shortestDist = dist;
-        nearestIdx = i;
-      }
-    }
-
-    const nextStop = remainingDests.splice(nearestIdx, 1)[0];
-    sequencedDests.push(nextStop);
-    currentLoc = nextStop;
-  }
-
-  // Calculate cumulative road distance after first drop
-  let cumulativeDist = 0;
+  // Build RouteStop objects with calculated leg distances
   const stops: RouteStop[] = [];
 
   for (let i = 0; i < sequencedDests.length; i++) {
@@ -186,7 +346,6 @@ export function buildRouteStops(
     if (i > 0) {
       const prev = sequencedDests[i - 1];
       legDist = getDistanceBetweenPoints(prev.lat, prev.lon, item.lat, item.lon, cachedMatrix);
-      cumulativeDist += legDist;
     }
 
     stops.push({
@@ -202,11 +361,9 @@ export function buildRouteStops(
     });
   }
 
-  const roundedCumulativeDist = Math.round(cumulativeDist * 100) / 100;
-
   return {
     stops,
-    cumulativeDistanceKm: roundedCumulativeDist,
+    cumulativeDistanceKm: totalDistanceKm,
     isMultiDrop: sequencedDests.length > 1,
   };
 }

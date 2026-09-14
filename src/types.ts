@@ -2,15 +2,27 @@ export type VehicleType = '25' | '30' | '35';
 
 export interface OrderLineItem {
   id: string | number;
+  invoiceNo?: string; // Original Inv No. (e.g. "150110039")
   invQt: number; // Order Weight in MT
   soPoDate: string; // DD/MM/YYYY
   soStoCreationTime: string; // HH:MM:SS
-  soldToParty: string; // Unique Dealer ID
-  shipToPartyName: string; // Sub-dealer / Secondary Receiver
-  dest: string; // Destination Name
+  soldToParty: string; // Dealer ID / Code (e.g. "302824")
+  soldToPartyName?: string; // Dealer Name (e.g. "JOYGURU TRADERS")
+  shipToPartyName: string; // Sub-dealer / Secondary Receiver (e.g. "SRI HIRALAL PAUL")
+  dest: string; // Destination Name (e.g. "DASDA")
   lat: number; // Latitude
   lon: number; // Longitude
   rawRowData: Record<string, any>; // Original row data preserved
+
+  // Ingested Dispatch metadata
+  clubId?: string | number | null; // Club ID for batching (null/0/NA = unclubbed)
+  truckNo?: string; // Dispatched vehicle identifier/license
+  transpName?: string; // Transporter name
+  truckTypeRaw?: string; // e.g. "12 wheeler", "14 wheeler", "16 wheeler"
+  historicalRatedCapacityMT?: number; // 25, 30, 35 MT
+  isHistoricallyClubbed?: boolean;
+  eWayBillDateTime?: string; // Raw/parsed E-Way Bill date & time (e.g. "01.10.2026 10:15:00")
+  eWayBillDate?: string; // Extracted E-Way Bill date only (e.g. "01.10.2026")
   
   // SLA & Temporal fields
   calculatedSla?: {
@@ -20,6 +32,12 @@ export interface OrderLineItem {
     formattedStartTime: string;
     formattedExpiryTime: string;
     isRolledOver: boolean;
+    eWayBillTimestamp?: number;
+    formattedEWayBillTime?: string;
+    isSlaBreached?: boolean;
+    delayMinutes?: number;
+    delayHours?: number;
+    formattedDelay?: string;
   };
 
   // Optimization output fields
@@ -28,6 +46,81 @@ export interface OrderLineItem {
   allocationReason?: string;
   dropSequence?: number;
   priorityCategory?: 'Priority I' | 'Priority II' | 'Priority III' | 'Unassigned';
+}
+
+export interface HistoricalDispatch {
+  dispatchKey: string; // Unique identifier for the historical dispatch (e.g. <truckNo>_<ebillDate>)
+  truckNo: string;
+  dispatchDate?: string; // E-Way Bill date (or SO/PO date fallback) formatted as Dispatch Date
+  eWayBillDate?: string; // Extracted date (DD.MM.YYYY)
+  eWayBillDateTime?: string; // Full date & time (DD.MM.YYYY HH:MM:SS)
+  soPoDate?: string;
+  transpName: string;
+  truckTypeRaw: string;
+  ratedCapacityMT: number; // 25, 30, 35 MT
+  clubId?: string | number | null;
+  orders: OrderLineItem[];
+  totalWeightMT: number;
+  utilizationPercent: number;
+  isOverweight: boolean;
+  excessWeightMT: number;
+  isClubbed: boolean;
+  isMultiDrop: boolean;
+  destinations: string[];
+  interDropDistanceKm: number;
+  radiusThresholdBreaches: number;
+  dealers: string[]; // Unique Dealer IDs
+  dealerNames: string[]; // Unique Dealer Names
+  dropPointsCount: number;
+  totalOrdersCount: number;
+
+  // SLA Performance metrics for this historical dispatch
+  slaBreachedOrdersCount: number;
+  maxOrderDelayHours: number;
+  avgOrderDelayHours: number;
+  isSlaBreached: boolean;
+}
+
+export interface SlaBreachStats {
+  totalOrders: number;
+  breachedOrdersCount: number;
+  breachedOrdersPercent: number;
+  compliantOrdersCount: number;
+  maxDelayHours: number;
+  avgDelayHours: number;
+  medianDelayHours: number;
+  formattedMaxDelay: string;
+  formattedAvgDelay: string;
+  formattedMedianDelay: string;
+}
+
+export interface MultiDropBreakupStats {
+  totalVehicles: number;
+  totalOrders: number;
+  fleet25Count: number;
+  fleet30Count: number;
+  fleet35Count: number;
+  fleetOtherCount: number;
+}
+
+export interface HistoricalMetrics {
+  totalUniqueTrucks: number;
+  fleet25Count: number;
+  fleet30Count: number;
+  fleet35Count: number;
+  fleetOtherCount: number;
+  totalOrders: number;
+  totalClubbedOrders: number;
+  totalUnclubbedOrders: number;
+  totalDispatches: number;
+  overweightDispatchesCount: number;
+  totalExcessTonnageMT: number;
+  averageCapacityUtilizationPercent: number;
+  distanceWeightedAvgInterDropDistanceKm: number | null;
+  radiusThresholdBreachesCount: number;
+  dispatches: HistoricalDispatch[];
+  slaStats: SlaBreachStats;
+  multiDropStats: MultiDropBreakupStats;
 }
 
 export interface OptimizationConfig {

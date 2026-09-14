@@ -3,6 +3,7 @@ import { OrderLineItem, OptimizationResult, DistanceMatrixData, LocationPoint } 
 import { SAMPLE_SALES_REGISTER_ORDERS } from './sampleData';
 import { getLocationKey, saveDistanceMatrixToStorage } from './distanceMatrixEngine';
 import { computeHaversineDistanceKm } from './haversine';
+import { mapTruckTypeToRatedCapacity, isClubIdActive, extractEBillDate } from './historicalMetricsCalculator';
 
 /**
  * Normalizes column keys to match PRD expectations regardless of minor typos or whitespace variations
@@ -396,10 +397,42 @@ export async function parseSalesRegisterFile(file: File): Promise<OrderLineItem[
     const rawDate = findColumnValue(row, ['SO/PO Date', 'SO Date', 'PO Date', 'Date', 'Order Date', 'SO/PO Date_1']) || '01/10/2026';
     const rawTime = findColumnValue(row, ['SO/STO creation time', 'SO/STO creat', 'SO/STO Creation', 'SO creation time', 'Creation Time', 'Time', 'Order Time']) || '10:00:00';
 
+    // Map E-Way Bill date & time (e.g. "DD.MM.YYYY HH:MM:SS")
+    const rawEwb = findColumnValue(row, [
+      'E-Way Bill date & time',
+      'E-Way Bill Date & Time',
+      'E-Way Bill date and time',
+      'E-Way Bill Date and Time',
+      'E-Way Bill Date & time',
+      'E-Way Bill Date',
+      'E-Way Bill date',
+      'E-Way Bill Date/Time',
+      'E-Way Bill Time',
+      'E-Way Bill & Time',
+      'Eway Bill date & time',
+      'Eway Bill Date & Time',
+      'Eway Bill Date',
+      'E-Way Bill No & Date',
+      'E-Way Bill',
+      'E-Way Date',
+      'Ebill Date & Time',
+      'Ebill Date',
+      'EBill Date & Time',
+      'EBill Date',
+      'Dispatch Date',
+    ]);
+    const ewbStr = rawEwb !== undefined && rawEwb !== null ? String(rawEwb).trim() : '';
+    const ewbDate = extractEBillDate(rawEwb);
+
+    // Map Invoice No / Order No
+    const rawInvNo = findColumnValue(row, ['Original Inv No.', 'Original Inv No', 'Original Inv', 'Invoice No.', 'Invoice No', 'Inv No.', 'Inv No', 'Invoice Number', 'SO No', 'SO Number', 'Order No', 'Order Number']);
+    const invoiceNo = rawInvNo ? String(rawInvNo).trim() : `INV-${index + 1}`;
+
     // Map Parties & Dest
-    const soldToParty = String(findColumnValue(row, ['Sold to Party (dealer)', 'Sold to Party', 'Dealer', 'Dealer ID', 'Sold-to']) || `Dealer-${index + 1}`).trim();
-    const shipToParty = String(findColumnValue(row, ['Ship To Party Name', 'Ship to Party', 'Receiver', 'Consignee', 'Ship-to']) || soldToParty).trim();
-    const dest = String(findColumnValue(row, ['Dest.', 'Dest', 'Destination', 'Location', 'City']) || 'Main Hub').trim();
+    const soldToParty = String(findColumnValue(row, ['Sold to Party (dealer)', 'Sold To Party (dealer)', 'Sold to Party', 'Sold To Party', 'Dealer ID', 'Dealer Code', 'Dealer', 'Sold-to']) || `Dealer-${index + 1}`).trim();
+    const soldToPartyName = String(findColumnValue(row, ['Sold To Party Name (Dealer)', 'Sold to Party Name (Dealer)', 'Sold To Party Name', 'Sold to Party Name', 'Dealer Name']) || soldToParty).trim();
+    const shipToParty = String(findColumnValue(row, ['Ship To Party Name', 'Ship to Party Name', 'Ship To Party', 'Ship to Party', 'Receiver', 'Consignee', 'Ship-to']) || soldToPartyName).trim();
+    const dest = String(findColumnValue(row, ['Dest.', 'Dest', 'Dest. Point Name', 'Dest Point Name', 'Destination', 'Location', 'City']) || 'Main Hub').trim();
 
     // Map Coordinates
     const rawLat = findColumnValue(row, ['Lat', 'Latitude', 'dest_lat', 'Destination Lat']);
@@ -412,16 +445,36 @@ export async function parseSalesRegisterFile(file: File): Promise<OrderLineItem[
       continue;
     }
 
+    // Map new ingestion columns: Club ID, Truck No., Transp Name, Truck Type
+    const rawClub = findColumnValue(row, ['Club ID', 'ClubID', 'Club_ID', 'Club Id', 'Club', 'Batch ID']);
+    const isClubbed = isClubIdActive(rawClub);
+    const clubIdVal = isClubbed ? (typeof rawClub === 'number' ? rawClub : String(rawClub).trim()) : null;
+
+    const truckNo = String(findColumnValue(row, ['Truck No.', 'Truck No', 'TruckNo', 'Vehicle No', 'Vehicle Number', 'Truck Number']) || '').trim();
+    const transpName = String(findColumnValue(row, ['Transp Name', 'Transporter Name', 'Transporter', 'Transp', 'Carrier']) || '').trim();
+    const truckTypeRaw = String(findColumnValue(row, ['Truck Type', 'TruckType', 'Vehicle Type', 'Type']) || '12 wheeler').trim();
+    const ratedCap = mapTruckTypeToRatedCapacity(truckTypeRaw);
+
     parsedOrders.push({
       id: index + 1,
+      invoiceNo,
       invQt: Math.round(weightNum * 100) / 100,
       soPoDate: String(rawDate).trim(),
       soStoCreationTime: String(rawTime).trim(),
+      eWayBillDateTime: ewbStr || undefined,
+      eWayBillDate: ewbDate || undefined,
       soldToParty,
+      soldToPartyName,
       shipToPartyName: shipToParty,
       dest,
       lat: latNum,
       lon: lonNum,
+      clubId: clubIdVal,
+      truckNo: truckNo || undefined,
+      transpName: transpName || undefined,
+      truckTypeRaw: truckTypeRaw || undefined,
+      historicalRatedCapacityMT: ratedCap,
+      isHistoricallyClubbed: isClubbed,
       rawRowData: row,
     });
   }
@@ -435,14 +488,54 @@ export async function parseSalesRegisterFile(file: File): Promise<OrderLineItem[
 
 /**
  * Generates and downloads a sample Input Sales Register Excel template
+ * Includes headers: E-Way Bill date & time, Club ID, Truck No., Transp Name, Truck Type
+ * Prepopulated with dummy rows illustrating clubbed and unclubbed dispatches.
  */
 export function downloadSampleSalesRegisterExcel(filename = 'Sample_Sales_Register_Input.xlsx'): void {
   const wb = XLSX.utils.book_new();
 
-  const rows = SAMPLE_SALES_REGISTER_ORDERS.map((item) => item.rawRowData);
-  const ws = XLSX.utils.json_to_sheet(rows);
+  // Explicitly ensure the headers are first-class in the exported sheet
+  const rows = SAMPLE_SALES_REGISTER_ORDERS.map((item) => {
+    const rawEwb = item.rawRowData?.['E-Way Bill date & time'] 
+      ?? (item.eWayBillDateTime ?? `${item.soPoDate ? item.soPoDate.replace(/\//g, '.') : '01.10.2026'} ${item.soStoCreationTime || '10:15:00'}`);
 
+    return {
+      'Order No': item.rawRowData?.['Order No'] || `SO-${9000 + Number(item.id)}`,
+      'Inv Qt.(MT)': item.invQt,
+      'E-Way Bill date & time': rawEwb,
+      'SO/PO Date': item.soPoDate,
+      'SO/STO creation time': item.soStoCreationTime,
+      'Sold to Party (dealer)': item.soldToParty,
+      'Ship To Party Name': item.shipToPartyName,
+      'Dest.': item.dest,
+      'Lat': item.lat,
+      'Lon': item.lon,
+      'Club ID': item.rawRowData?.['Club ID'] ?? (item.clubId ?? 'NA'),
+      'Truck No.': item.rawRowData?.['Truck No.'] ?? (item.truckNo ?? 'MH-01-AA-1001'),
+      'Transp Name': item.rawRowData?.['Transp Name'] ?? (item.transpName ?? 'Apex Logistics'),
+      'Truck Type': item.rawRowData?.['Truck Type'] ?? (item.truckTypeRaw ?? '12 wheeler'),
+      'Product Code': item.rawRowData?.['Product Code'] || 'CEM-OPC-53',
+      'Customer Region': item.rawRowData?.['Customer Region'] || 'Central',
+    };
+  });
+
+  const ws = XLSX.utils.json_to_sheet(rows);
   XLSX.utils.book_append_sheet(wb, ws, 'Sales Register');
+
+  // Sheet 2: Ingestion Dictionary & Field Specifications
+  const specs = [
+    { 'Column Header': 'E-Way Bill date & time', 'Type': 'String (DD.MM.YYYY HH:MM:SS)', 'Description': 'E-Way Bill timestamp (e.g. 01.10.2026 10:15:00). The extracted e-way bill date is used as the Dispatch Date and forms the unique truck dispatch key (<Truck No.>_<EBill Date>).' },
+    { 'Column Header': 'Truck No.', 'Type': 'String', 'Description': 'Dispatched vehicle license plate / identifier (e.g. MH-04-DE-4004).' },
+    { 'Column Header': 'Transp Name', 'Type': 'String', 'Description': 'Transporter entity name (e.g. Apex Roadlines, Zenith Express).' },
+    { 'Column Header': 'Truck Type', 'Type': 'String', 'Description': 'Vehicle tier mapping: "12 wheeler" -> 25 MT, "14 wheeler" -> 30 MT, "16 wheeler" -> 35 MT.' },
+    { 'Column Header': 'Club ID', 'Type': 'String | Number', 'Description': 'If non-zero number/string, rows are clubbed into a single vehicle batch. If "NA", "None", 0, or empty, treated as an unclubbed individual dispatch.' },
+    { 'Column Header': 'Inv Qt.(MT)', 'Type': 'Numeric', 'Description': 'Order quantity / weight in Metric Tonnes.' },
+    { 'Column Header': 'Dest.', 'Type': 'String', 'Description': 'Destination delivery city / depot name.' },
+    { 'Column Header': 'Lat / Lon', 'Type': 'Decimal', 'Description': 'Coordinates of destination for distance calculation.' },
+  ];
+  const wsSpecs = XLSX.utils.json_to_sheet(specs);
+  XLSX.utils.book_append_sheet(wb, wsSpecs, 'Column Data Dictionary');
+
   XLSX.writeFile(wb, filename);
 }
 
