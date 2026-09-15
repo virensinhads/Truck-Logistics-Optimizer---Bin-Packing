@@ -15,6 +15,8 @@ A comprehensive logistics payload optimization, distance matrix evaluation, and 
 8. [Using the Standalone CLI Scripts](#using-the-standalone-cli-scripts)
 9. [File Formats & Schema Guidelines](#file-formats--schema-guidelines)
 10. [SLA & Cluster Tracking](#sla--cluster-tracking)
+11. [Latest Enhancements](#latest-enhancements)
+12. [Project Documentation & Agent Guides](#project-documentation--agent-guides)
 
 ---
 
@@ -235,6 +237,49 @@ A square table where row headers represent origins and column headers represent 
 - **Transit Time Model**: Estimated based on real road geometry, terrain speed profiles (35–55 km/h depending on distance), and mandatory driver break times.
 - **Handling Overhead**: Configurable unloading buffers per multi-drop stop (default: 45 minutes per intermediate drop).
 - **SLA Breach Detection**: Highlights orders where computed transit time + unloading exceeds agreed client service level agreements.
+
+---
+
+## 🆕 Latest Enhancements
+
+1. **Exact Permutation Route Sequence Optimization**:
+   - Upgraded the multi-drop route sequencer from a simple greedy nearest-neighbor algorithm to an exact permutation-based sequence search.
+   - Evaluates all $K!$ stop permutations starting from the origin depot to find the exact traversal order that minimizes cumulative route road mileage.
+
+2. **Historical SLA Breach & Dispatch Delay Analytics**:
+   - **E-Way Bill vs. SLA Expiry**: Automatically compares order creation timestamps against warehouse shift working windows (e.g., 10:00 to 17:00, 2-hour SLA window) with rollover logic, comparing against the actual E-Way Bill date/time.
+   - **Comprehensive Delay Metrics**: Computes exact dispatch delay in hours and presents **Maximum Delay**, **Average Delay**, and **Median Delay** in both summary scorecards and order line manifests.
+   - **Historical Manifest Badges**: Displays color-coded SLA compliance badges (`SLA Met` vs. `SLA Breached (+X.X hrs)`) with detailed timestamp columns.
+
+3. **Multi-Drop Fleet Breakdown & Distance-Weighted Metrics**:
+   - **Weighted Drop Proximity**: Computes distance-weighted average inter-drop distance $\frac{\sum (\text{Payload} \times \text{Route Distance})}{\sum \text{Payload}}$ strictly across multi-drop dispatches.
+   - **Fleet Category Breakup**: Displays the exact vehicle count and order distribution across fleet types (25MT, 30MT, 35MT) for both historical actual dispatches and engine optimization proposals.
+
+4. **Multi-Criteria Historical Filter Bar**:
+   - Added an interactive SLA Delay filter enabling users to filter dispatches by:
+     - `All SLA Statuses`
+     - `Any SLA Breach (>0h delay)`
+     - `SLA Met (On-Time)`
+     - `Delay >= 2 Hours`, `Delay >= 4 Hours`, `Delay >= 8 Hours`, `Delay >= 24 Hours`
+     - `Custom Delay >= X Hours` with a dedicated numeric threshold stepper.
+
+5. **Executive PowerPoint Presentation Generation (`.pptx`)**:
+   - Direct in-browser generation of high-resolution 16:9 executive PowerPoint slide decks using `pptxgenjs`.
+   - Includes professional slide layouts covering system architecture, mathematical formulas, historical benchmark scorecards, and fleet utilization recommendations.
+
+---
+
+## 📚 Project Documentation & Agent Guides
+
+For developers and AI coding agents working on this codebase, refer to the following specialized guides:
+- [AGENT_INSTRUCTIONS.md](./AGENT_INSTRUCTIONS.md): Global rules, coding standards, tech stack, and conventions for AI agents.
+- [EXTERNAL_DEPENDENCIES.md](./EXTERNAL_DEPENDENCIES.md): Detailed inventory of runtime, build, and external service dependencies (OSRM, OpenStreetMap, Leaflet, SheetJS, PptxGenJS).
+- [Product Requirements Document (PRD)](./docs/PRD.md): End-to-end PRD covering business objectives, personas, functional requirements, and edge cases.
+- [01_IDEATION.md](./docs/01_IDEATION.md): Product ideation, user journeys, and functional scope boundaries.
+- [02_DATABASE.md](./docs/02_DATABASE.md): Data schema, ERD, and models (Client-side architecture).
+- [03_BACKEND.md](./docs/03_BACKEND.md): API architecture and backend logic (Client-side architecture).
+- [04_FRONTEND.md](./docs/04_FRONTEND.md): UI/UX specifications, component tree, and state management.
+- [05_DEPLOYMENT.md](./docs/05_DEPLOYMENT.md): Build pipelines, container hosting, port 3000 ingress, and environment variables.
 
 ---
 

@@ -1,0 +1,33 @@
+{
+  "project": "Logistics Payload & Route Optimization Engine",
+  "version": "1.0.0",
+  "framework": "React 19 + TypeScript + Vite",
+  "styling": "Tailwind CSS v4",
+  "architecture": "Client-side SPA with standalone Node CLI scripts",
+  "rules": {
+    "typescript": {
+      "strict": true,
+      "noImplicitAny": true,
+      "namedImportsOnly": true,
+      "noConstEnums": true
+    },
+    "styling": {
+      "framework": "Tailwind CSS v4 (@import 'tailwindcss')",
+      "noCustomCssFiles": true,
+      "noInlineStyles": true,
+      "icons": "lucide-react"
+    },
+    "routingAndMaps": {
+      "library": "leaflet",
+      "distanceCalculation": "OSRM Table API with OpenStreetMap and Haversine (1.3x circuity) fallbacks"
+    },
+    "dataProcessing": {
+      "excelParser": "xlsx",
+      "presentationExport": "pptxgenjs"
+    },
+    "environment": {
+      "port": 3000,
+      "host": "0.0.0.0"
+    }
+  }
+}
